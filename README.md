@@ -262,3 +262,48 @@ financial-qa-agent/
 - **Frontend**: Vanilla HTML / CSS / JS (no build step)
 - **Package Manager**: [uv](https://docs.astral.sh/uv/)
 - **Testing**: pytest, pytest-asyncio, httpx
+
+
+## 交付内容
+
+- 系统架构图
+    - 自动生成和维护了3个架构图在README的Architecture章节
+      - System Architecture 主要展示的是前后端，数据库，外部数据接口相关的数据和交互流程。
+      - Agent Loop 详细解释了后端Agent部分是怎么处理用户的query，构建context，获取最后回复的整个流程。
+      - Project Structure 是文件粒度的实现内容
+    - 会在视频中walk through一下架构
+
+- 技术选型说明
+  - 具体选型可以参考自动生成的Tech Stack章节，这边解释一下指导选型的一些rationale.
+  - 前端: 我个人没有前端经验，所以主要逻辑都写在后端，前端就是一个静态页面排版和简单用stream api从后端获取数据的页面。
+  - 后端：轻量级的FastApi做server，ChromaDB 作为demo使用的本地小vec db作为knowledge hub，额外需要的context数据通过专用的金融服务api，和通用的brave search API从外部获取。
+  - Agent编排：用Langgraph编排简单的，确定性高agent workflow。
+
+- Prompt 设计思路
+  - 本项目目前主要用了以下几套prompt处理agent workflow里面的不同问题
+  - 第一套prompt用于理解用户的输入
+    - 区分输入是一个资产分析的需求，还是知识询问的需求
+    - 针对这两种不同需求，还要求llm输出对应需求的后续workflow中所需要的参数，比如是否需要news，需求的数据的粒度和period如何，是否需要基本面数据，等等
+  - 第二套prompt用于生成最后的回答输出
+    - 规定了输出的具体格式，对应业务要求的"区分事实和分析内容"，"结构清晰"。
+    - 将agent workflow中前几部分data retrieval做一个整合拼接到context中。
+  - 还有一些小的prompt，和一些langchain"自带"的prompt，主要用于完成在agent workflow中的小任务，比如判断信息是否足够，做一些RAG过程中可能需要的summarization.
+
+- 数据来源说明
+  - 金融数据
+    - 量价数据: yfinance, free tier
+    - 基本面数据: FMP, free tier，只支持income statement用于demo
+  - web search: Brave API, free tier
+
+- 优化扩展
+  - 首先需要优化的是现在的agent loop。用langgraph或者其他类似的工具认为编排整个agent flow其实并不是一个好的选择。生产系统上应当使用基于ReAct Loop的Agent Harness。
+    - 他的优点在于确定性高，编写的预期比较明确，解决简单固定的agent任务落地快容易调试。
+    - 他的缺点是，迭代维护起来会很麻烦，需求一动要改workflow而且动一个节点上下游都可能受到影响。而且对于复杂模糊的任务，人工抽象workflow可能会有数不清的补丁要打才能达到不断演进的需求，输入的corner case之类的情况。
+    - 更主要的问题是，在模型能力已经非常强的现在，agent workflow对应的planning或者reasoning的能力基模早已经具备，更好的选择是作为agent开发，只需要一个通过的ReAct loop，和一系列调试过有效的相关tooling和skilling，然后让模型自身通过loop来动态生成每一个user request的执行workflow。
+  
+  - 第二需要优化的是数据源。现在的结构化数据和非结构化数据是直接从金融服务和搜索API中获取，但如果要严肃的做一个金融Q&A Agent，应该需要维护自己的数据仓库。
+    - 原因一，对于Market Data，有直接的性能，成本，稳定性的考虑。
+    - 原因二，对于news这类非结构化数据，直接通过search API能获得的质量是非常差的，需要大量的甄别清洗，提炼出高质量的数据，标注metadata，后续的分析才能有实际的交易价值。
+    - 原因三，knowledge hub的构建，也需要大量的爬取来构造知识库，否则能retrieve到的甚至不如基座模型自带的语料。也因此，本项目的vec db只是为了演示流程和concept。
+
+  - 第三需要优化的Agent Loop对于不同输入有可能产生的异常和对应的处理，做这件事需要通过大量的内部test case构造，以及在上线后定期地根据线上数据改进tooling & prompts，甚至对于基座模型做RL（根据我的了解，除了coding agent还比较少有做到这一步的）。
