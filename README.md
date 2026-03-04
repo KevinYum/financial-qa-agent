@@ -59,6 +59,7 @@ flowchart TB
             TRACE["Trace Queue\n(contextvars)"]
             PARSE["parse\n(LLM)"]
             FETCH_MD["fetch_market_data\n(yfinance)"]
+            FETCH_FD["fetch_fundamental_data\n(FMP API)"]
             FETCH_NEWS["fetch_news\n(Brave API)"]
             FETCH_LOCAL["fetch_local_knowledge\n(ChromaDB)"]
             EVAL_SUFF["evaluate_sufficiency\n(LLM)"]
@@ -69,6 +70,7 @@ flowchart TB
 
     subgraph External["External Services"]
         LLM_API["LLM API\n(OpenAI / OpenRouter)"]
+        FMP["FMP API\n(Financial Modeling Prep)"]
         BRAVE["Brave Search API"]
         YAHOO["Yahoo Finance"]
     end
@@ -89,18 +91,19 @@ flowchart TB
     %% Agent flow
     STREAM -- "validate" --> REQ
     REQ --> PARSE
-    PARSE --> FETCH_MD & FETCH_NEWS & FETCH_LOCAL
-    FETCH_MD & FETCH_NEWS --> SYNTH
+    PARSE --> FETCH_MD & FETCH_FD & FETCH_NEWS & FETCH_LOCAL
+    FETCH_MD & FETCH_FD & FETCH_NEWS --> SYNTH
     FETCH_LOCAL --> EVAL_SUFF
     EVAL_SUFF -. "sufficient" .-> SYNTH
     EVAL_SUFF -. "insufficient" .-> FETCH_WEB
     FETCH_WEB --> SYNTH
-    PARSE & FETCH_MD & FETCH_NEWS & FETCH_LOCAL & EVAL_SUFF & FETCH_WEB & SYNTH -. "trace events" .-> TRACE
+    PARSE & FETCH_MD & FETCH_FD & FETCH_NEWS & FETCH_LOCAL & EVAL_SUFF & FETCH_WEB & SYNTH -. "trace events" .-> TRACE
     TRACE -. "SSE stream" .-> JS
     JS -- "render chat + trace" --> UI
 
     %% External connections
-    PARSE & SYNTH -. "LLM calls" .-> LLM_API
+    PARSE & SYNTH & FETCH_FD -. "LLM calls" .-> LLM_API
+    FETCH_FD -. "statements + transcripts" .-> FMP
     FETCH_MD -. "OHLCV + info" .-> YAHOO
     FETCH_NEWS -. "web search" .-> BRAVE
     FETCH_LOCAL -. "vector search" .-> CHROMA
@@ -117,7 +120,7 @@ flowchart TB
     style Local fill:#e2e3e5,stroke:#495057
 ```
 
-**Interaction Pattern**: The frontend sends `POST /api/ask/stream` via `fetch()`. FastAPI validates through Pydantic, then launches the LangGraph agent with a trace queue. The agent parses the question into structured entities (tickers, time period, news flag, knowledge queries), then routes based on question type: **analysis** (tickers found → market data + optional news → sectioned answer: Fact + Analysis + References) or **knowledge hub** (no tickers → local ChromaDB first → LLM evaluates sufficiency → if insufficient, web search → sectioned answer: Answer + References). The LLM produces markdown with `##` section headers; the frontend renders it via `marked.js` (sanitized with DOMPurify) so headers, links, lists, bold text, tables, and code all display correctly. Each pipeline stage emits trace events to an `asyncio.Queue`, which the SSE generator streams to the browser in real-time. The frontend renders trace events in a 5-tab trace panel (Agent Loop, Market Data, News Search, Local Knowledge, Web Knowledge) and the final markdown answer in the chat panel. A batch endpoint (`POST /api/ask`) is also available for backward compatibility.
+**Interaction Pattern**: The frontend sends `POST /api/ask/stream` via `fetch()`. FastAPI validates through Pydantic, then launches the LangGraph agent with a trace queue. The agent parses the question into structured entities (tickers, time period, news flag, knowledge queries, fundamental data needs), then routes based on the parser's `question_type`: **analysis** (parser says analysis + tickers present → market data + optional fundamental data + optional news → sectioned answer: Fact + Analysis + References) or **knowledge hub** (parser says knowledge → local ChromaDB first → LLM evaluates sufficiency → if insufficient, web search → sectioned answer: Answer + References; tickers are ignored). For equity tickers, the parser can request FMP fundamental data (financial statements, earnings transcripts); transcripts are summarized via LLM before inclusion. The LLM produces markdown with `##` section headers; the frontend renders it via `marked.js` (sanitized with DOMPurify) so headers, links, lists, bold text, tables, and code all display correctly. Each pipeline stage emits trace events to an `asyncio.Queue`, which the SSE generator streams to the browser in real-time. The frontend renders trace events in a 4-tab trace panel (Agent Loop, Market Data with Price/Fundamental sub-sections, News, Knowledge with Local/Online sub-sections) and the final markdown answer in the chat panel. A batch endpoint (`POST /api/ask`) is also available for backward compatibility.
 
 ---
 
@@ -130,13 +133,14 @@ User Question
 ┌─────────────┐
 │    parse     │  ← LLM call: extract tickers, time period, news flag, knowledge queries
 └──────┬──────┘
-       │  (route by question type — determined by tickers)
+       │  (route by parser's question_type)
        │
-       ├── tickers found? ─── TYPE A: ANALYSIS ──────────────────────────────────────────┐
-       │   └── fetch_market_data   (yfinance OHLCV + fundamentals)                       │
-       │   └── [+ fetch_news]      (Brave Search API, if needs_news)                     │
+       ├── analysis? ────── ANALYSIS PATH ─────────────────────────────────────────────┐
+       │   └── fetch_market_data        (yfinance OHLCV + fundamentals)                  │
+       │   └── [+ fetch_fundamental_data] (FMP: statements + transcripts, if equity)     │
+       │   └── [+ fetch_news]           (Brave Search API, if needs_news)                │
        │                                                                                  │
-       ├── no tickers? ──── TYPE B: KNOWLEDGE HUB ──────────────────────────────────┐    │
+       ├── knowledge? ──── KNOWLEDGE HUB (tickers ignored) ────────────────────────┐    │
        │   └── fetch_local_knowledge     (ChromaDB vector search)                    │    │
        │          │                                                                  │    │
        │          ▼                                                                  │    │
@@ -162,7 +166,7 @@ User Question
 └─────────────┘
 ```
 
-**Two question types**: The presence of tickers in the parse result determines the question type. **Analysis** questions (tickers found) fetch market data and optionally news, producing a sectioned answer: **Fact** (structured data) + **Analysis** (interpretation) + **References** (news links, if available). **Knowledge** questions (no tickers) use a **knowledge hub** approach: local ChromaDB is queried first, then an LLM evaluates whether the local results sufficiently answer the question — if not, a web search is triggered and results are stored in ChromaDB for future use. The final answer is a sectioned response: **Answer** (explanation) + **References** (source links). The LLM outputs markdown; the frontend renders it natively via `marked.js` with DOMPurify sanitization.
+**Two question types** driven by the parse LLM's `question_type` field: **Analysis** (parser says "analysis" + tickers present) fetches market data, optionally FMP fundamental data (financial statements + earnings transcripts for equities), and optionally news, producing a sectioned answer: **Fact** (Key Metrics + Summary) + **Analysis** (interpretation) + **References** (news links, if available). **Knowledge** (parser says "knowledge") uses a **knowledge hub** approach: local ChromaDB is queried first, then an LLM evaluates whether the local results sufficiently answer the question — if not, a web search is triggered and results are stored in ChromaDB for future use. Knowledge questions ignore any tickers — no market data or fundamental data is fetched. The final answer is a sectioned response: **Answer** (explanation) + **References** (source links). The LLM outputs markdown; the frontend renders it natively via `marked.js` with DOMPurify sanitization.
 
 ---
 
@@ -186,6 +190,7 @@ financial-qa-agent/
 │   └── tools/                      --- Data fetching tool modules
 │       ├── __init__.py             --- Tool exports
 │       ├── market_data.py          --- yfinance: OHLCV, fundamentals (tickers from parse node)
+│       ├── fundamental_data.py     --- FMP API: financial statements + earnings transcripts
 │       ├── news_search.py          --- Brave Search API: recent financial news
 │       └── knowledge_base.py       --- Local ChromaDB search + web search with auto-population
 │
@@ -198,9 +203,9 @@ financial-qa-agent/
 │   ├── __init__.py
 │   ├── conftest.py                 --- Shared fixtures (mock LLM responses)
 │   ├── test_api.py                 --- API endpoint + SSE stream tests (7 tests)
-│   ├── test_agent.py               --- LangGraph pipeline + routing + trace tests (32 tests)
-│   ├── test_models.py              --- Pydantic model unit tests (28 tests)
-│   └── test_tools.py               --- Tool unit tests (18 tests)
+│   ├── test_agent.py               --- LangGraph pipeline + routing + trace tests (38 tests)
+│   ├── test_models.py              --- Pydantic model unit tests (39 tests)
+│   └── test_tools.py               --- Tool unit tests (26 tests)
 │
 ├── specs/                          --- Living specifications
 │   ├── api.md                      --- Endpoint contracts and response format
@@ -266,6 +271,7 @@ financial-qa-agent/
 - **Agent Orchestration**: [LangGraph](https://langchain-ai.github.io/langgraph/) (StateGraph)
 - **LLM Provider**: [langchain-openai](https://python.langchain.com/docs/integrations/chat/openai/) (OpenAI / OpenRouter)
 - **Market Data**: [yfinance](https://github.com/ranaroussi/yfinance) (OHLCV, fundamentals)
+- **Fundamental Data**: [Financial Modeling Prep](https://financialmodelingprep.com/) (financial statements, earnings transcripts — free tier)
 - **News Search**: [Brave Search API](https://brave.com/search/api/)
 - **Knowledge Base**: [ChromaDB](https://www.trychroma.com/) (local vector DB with web fallback)
 - **Frontend**: Vanilla HTML / CSS / JS (no build step)

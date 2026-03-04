@@ -20,6 +20,7 @@ from .models import (
     ToolOutputEvent,
     TraceEvent,
 )
+from .tools.fundamental_data import fetch_fundamental_data
 from .tools.knowledge_base import fetch_local_knowledge, fetch_web_knowledge
 from .tools.market_data import fetch_market_data
 from .tools.news_search import fetch_news
@@ -76,7 +77,9 @@ class ParseResult(TypedDict, total=False):
     sector: str | None  # Sector name when asset_type is "sector"
     needs_news: bool  # Whether to fetch news for this question
     news_query: str | None  # Refined search query for Brave
-    knowledge_queries: list[str]  # Conceptual sub-questions for knowledge base
+    knowledge_query: str | None  # Single RAG-optimized query for knowledge base
+    needs_fundamentals: bool  # Whether to fetch FMP fundamental data
+    fundamental_endpoints: list[str]  # FMP APIs to call
 
 
 class AgentState(TypedDict):
@@ -94,6 +97,7 @@ class AgentState(TypedDict):
     parse_result: ParseResult
     question_type: str  # "analysis" or "knowledge" (from parse LLM, for tracing)
     market_data: str
+    fundamental_data: str  # FMP financial statements + transcript summaries
     news_data: str
     local_knowledge_data: str  # ChromaDB local results
     web_knowledge_data: str  # Brave web search results
@@ -131,18 +135,21 @@ structured entities.
 
 Extraction rules:
 - question_type: Determine the user's intent — "analysis" or "knowledge". \
-"analysis" means the user wants data-driven market analysis: price checks, \
-performance comparisons, trend analysis, technical analysis, portfolio review. \
-The answer will present computed facts from OHLCV data + analytical interpretation. \
-"knowledge" means the user wants explanations, reasons, concepts, mechanisms, \
-or contextual understanding — even if specific assets are mentioned. \
-Examples: "AAPL过去一年涨了多少" → analysis (wants price change data). \
-"黄金最近两月涨的原因是什么" → knowledge (wants explanation of why gold rose). \
+"analysis" means the user wants data about specific financial instruments: \
+price checks, performance, financial reports, earnings, comparisons, trends, \
+outlook, or any question where fetching market/fundamental data would help. \
+"knowledge" means the user wants explanations, concepts, mechanisms, \
+history, or education — tickers parsed for knowledge questions will be ignored \
+by the pipeline, so only set "analysis" when actual data retrieval is needed. \
+Examples: "AAPL过去一年涨了多少" → analysis (wants price data). \
+"黄金最近两月涨的原因是什么" → analysis (wants gold data + explanation). \
 "What is Apple's P/E ratio?" → analysis (wants a specific data point). \
-"Why did Tesla stock drop?" → knowledge (wants causal explanation). \
+"Why did Tesla stock drop?" → analysis (wants Tesla data to explain the drop). \
 "Compare AAPL and MSFT" → analysis (wants data comparison). \
-"How do stock options work?" → knowledge (wants concept explanation). \
-"What caused the 2008 financial crisis?" → knowledge (wants historical explanation).
+"阿里巴巴最近的财报如何" → analysis (wants BABA financial report data). \
+"How do stock options work?" → knowledge (general concept). \
+"What caused the 2008 financial crisis?" → knowledge (historical explanation). \
+"What is a P/E ratio?" → knowledge (concept explanation).
 - tickers: Resolve to yfinance-compatible symbols. \
 Company names to ticker (Apple → AAPL, Tesla → TSLA, Bank of America → BAC). \
 Crypto to -USD format (Bitcoin → BTC-USD, Ethereum → ETH-USD). \
@@ -192,9 +199,39 @@ If multiple tickers and at least one needs news, set true. \
 false for purely data or conceptual questions.
 - news_query: A concise search query for web search if needs_news is true. \
 Remove analytical framing, keep entity names and event keywords. Null if not needed.
-- knowledge_queries: List of conceptual or educational sub-questions \
-(e.g., "What is compound interest?", "How do stock options work?"). \
-Empty list if the question is purely about data or news.
+- knowledge_query: A single concise search query optimized for document \
+retrieval (RAG). Rewrite the user's question into a clear, keyword-rich \
+query that would match relevant documents in a knowledge base. \
+Strip conversational filler, keep core financial concepts and terms. \
+Examples: "Can you explain how compound interest works and why it matters?" \
+→ "compound interest mechanism and importance". \
+"I don't understand what a P/E ratio means, can you help?" \
+→ "P/E ratio definition price to earnings". \
+"How do stock options work and when should you exercise them?" \
+→ "stock options mechanics exercise strategy". \
+Null if the question is purely about data or news (question_type is "analysis").
+- needs_fundamentals: true if the question asks about financial statements, \
+revenue, earnings, profit, income, balance sheet, debt, equity, cash flow, \
+EBITDA, EPS, margins, financial ratios, ROE, ROA, dividend, book value, \
+earnings calls, management guidance, company outlook, or any fundamental \
+analysis that requires fiscal report data beyond what price snapshots provide. \
+IMPORTANT: Set false for non-equity assets (crypto like BTC-USD, \
+commodities like GC=F, forex like EURUSD=X, indices like ^GSPC, ETFs like XLK) \
+because fundamental data is only available for individual stocks.
+- fundamental_endpoints: List of fundamental data sources to query. Only two valid values: \
+"financial_statement" — fetches income statement, balance sheet, and cash flow together \
+as a single unit. Use for ANY question about revenue, earnings, profit, income, EPS, \
+EBITDA, margins, assets, liabilities, equity, debt, cash, cash flow, capex, dividends, \
+financial ratios, or general financial analysis. \
+"earnings_transcript" — fetches and summarizes the latest earnings call transcript. \
+Use ONLY when the question explicitly asks about what management said, earnings call \
+highlights, guidance, company outlook, or analyst Q&A. \
+Empty list if needs_fundamentals is false. \
+Examples: "What is Apple's revenue?" → ["financial_statement"]. \
+"Is AAPL's debt level healthy?" → ["financial_statement"]. \
+"Full financial analysis of MSFT" → ["financial_statement"]. \
+"What did Tim Cook say in the latest earnings call?" → ["earnings_transcript"]. \
+"Apple financial overview with earnings call highlights" → ["financial_statement", "earnings_transcript"].
 
 Today's date: {today}
 
@@ -203,7 +240,8 @@ Question: {question}
 Respond with ONLY valid JSON, no markdown fencing:
 {{"question_type": "analysis"|"knowledge", "tickers": [...], "company_names": [...], \
 "time_period": ..., "time_start": ..., "time_end": ..., "asset_type": ..., \
-"sector": ..., "needs_news": ..., "news_query": ..., "knowledge_queries": [...]}}"""
+"sector": ..., "needs_news": ..., "news_query": ..., "knowledge_query": ..., \
+"needs_fundamentals": ..., "fundamental_endpoints": [...]}}"""
 
 
 def _strip_markdown_fencing(raw: str) -> str:
@@ -257,7 +295,7 @@ async def parse_node(state: AgentState) -> dict:
         f"Extracted {len(validated.tickers)} ticker(s)"
         + (f": {', '.join(validated.tickers)}" if validated.tickers else "")
         + (f" | needs_news={validated.needs_news}" if validated.needs_news else "")
-        + (f" | {len(validated.knowledge_queries)} knowledge query(s)" if validated.knowledge_queries else "")
+        + (f" | knowledge_query={validated.knowledge_query!r}" if validated.knowledge_query else "")
     )
     logger.debug("parse_node: result=%s", result_dict)
     await _emit_trace(
@@ -300,6 +338,34 @@ async def fetch_market_data_node(state: AgentState) -> dict:
     return {"market_data": result}
 
 
+async def fetch_fundamental_data_node(state: AgentState) -> dict:
+    """Fetch fundamental financial data (statements + transcripts) from FMP."""
+    pr = state.get("parse_result", {})
+    input_data = {
+        "tickers": pr.get("tickers", []),
+        "fundamental_endpoints": pr.get("fundamental_endpoints", []),
+        "asset_type": pr.get("asset_type"),
+    }
+    await _emit_trace(
+        **TraceEvent(
+            stage="fetch_fundamental_data", status="started",
+            detail="Fetching fundamental data...",
+        ).model_dump()
+    )
+    await _emit_trace(**ToolInputEvent(tool="fundamental_data", input=input_data).model_dump())
+
+    result = await fetch_fundamental_data(state["question"], pr)
+
+    await _emit_trace(**ToolOutputEvent(tool="fundamental_data", output=result).model_dump())
+    await _emit_trace(
+        **TraceEvent(
+            stage="fetch_fundamental_data", status="completed",
+            detail="Fundamental data fetched",
+        ).model_dump()
+    )
+    return {"fundamental_data": result}
+
+
 async def fetch_news_node(state: AgentState) -> dict:
     """Fetch recent financial news via Brave Search."""
     pr = state.get("parse_result", {})
@@ -336,7 +402,7 @@ async def fetch_local_knowledge_node(state: AgentState) -> dict:
     """Fetch knowledge from local ChromaDB vector database."""
     pr = state.get("parse_result", {})
     input_data = {
-        "knowledge_queries": pr.get("knowledge_queries", []),
+        "knowledge_query": pr.get("knowledge_query"),
         "question": state["question"],
     }
     await _emit_trace(
@@ -430,7 +496,7 @@ async def fetch_web_knowledge_node(state: AgentState) -> dict:
     """Fetch knowledge from web search and store in ChromaDB."""
     pr = state.get("parse_result", {})
     input_data = {
-        "knowledge_queries": pr.get("knowledge_queries", []),
+        "knowledge_query": pr.get("knowledge_query"),
         "news_query": pr.get("news_query"),
         "question": state["question"],
     }
@@ -460,8 +526,9 @@ async def fetch_web_knowledge_node(state: AgentState) -> dict:
 
 
 SYNTHESIZE_ANALYSIS_PROMPT = """\
-You are a financial analyst assistant. Based on the market data and news \
-provided below, answer the user's question about the specified assets or markets.
+You are a financial analyst assistant. Based on the market data, fundamental \
+data, and news provided below, answer the user's question about the specified \
+assets or markets.
 
 Your answer MUST use the following section format with markdown headers. \
 Each section starts with a ## header on its own line, followed by the content.
@@ -489,6 +556,11 @@ Include the key number (e.g. "rose 12.3%" or "fell $15 to $142"). \
 This summary should let the reader grasp the answer at a glance before reading the Analysis.
 
 Do NOT dump all OHLCV rows — extract and compute what's needed.
+
+If fundamental financial data (income statements, balance sheets, cash flow, \
+or earnings transcript summaries) is also provided in the available data, \
+incorporate the relevant figures into your Key Metrics and analysis. Use \
+financial statement data to support your analysis with concrete fiscal metrics.
 
 ## Analysis
 Provide your analytical interpretation of the facts above. Directly address \
@@ -546,17 +618,17 @@ Provide your sectioned answer:"""
 async def synthesize_node(state: AgentState) -> dict:
     """Synthesize a final answer from all available tool outputs.
 
-    Reads question type from ``parse_result.question_type`` which is set by the
-    parse LLM based on user intent. This is more accurate than inferring from
-    data presence, since knowledge questions can also have market data as
-    supporting context (e.g. "Why did gold rise?" has tickers but wants
-    an explanation, not a data analysis).
+    Two clean paths: analysis (tickers → market/fundamental data) uses the
+    analysis prompt, knowledge (no tickers → local/web KB) uses the knowledge
+    prompt. Determined by ``parse_result.question_type``.
     """
     pr = state.get("parse_result", {})
     question_type = pr.get("question_type", "knowledge")
     sources = []
     if state.get("market_data"):
         sources.append("market_data")
+    if state.get("fundamental_data"):
+        sources.append("fundamental_data")
     if state.get("news_data"):
         sources.append("news")
     if state.get("local_knowledge_data"):
@@ -575,6 +647,8 @@ async def synthesize_node(state: AgentState) -> dict:
     context_parts: list[str] = []
     if state.get("market_data"):
         context_parts.append(f"### Market Data\n{state['market_data']}")
+    if state.get("fundamental_data"):
+        context_parts.append(f"### Fundamental Data\n{state['fundamental_data']}")
     if state.get("news_data"):
         context_parts.append(f"### Recent News\n{state['news_data']}")
     if state.get("local_knowledge_data"):
@@ -610,27 +684,27 @@ async def synthesize_node(state: AgentState) -> dict:
 
 
 def route_by_parse_result(state: AgentState) -> list[str] | str:
-    """Route to fetch node(s) based on LLM-determined question type.
+    """Route to fetch node(s) based on parser-determined question type.
 
-    The parse node determines ``question_type`` ("analysis" or "knowledge").
-    Routing combines question type with available tickers and news flags:
+    Two clean paths — driven by ``question_type`` from the parse LLM:
 
-    - **Analysis**: fetch_market_data (always) + fetch_news (if needs_news)
-    - **Knowledge with tickers**: fetch_market_data + fetch_local_knowledge
-      [+ fetch_news] — market data provides supporting context for the answer
-    - **Knowledge without tickers**: fetch_local_knowledge only
+    - **Analysis**: fetch_market_data [+ fetch_fundamental_data] [+ fetch_news]
+      → synthesize.  Requires tickers to be present.
+    - **Knowledge**: fetch_local_knowledge → evaluate_sufficiency
+      → [fetch_web_knowledge] → synthesize.  Tickers are ignored.
 
-    Note: ``question_type`` is set on the state dict for trace detail, but
-    LangGraph does not propagate routing-function mutations to downstream
-    nodes. The synthesize node reads ``question_type`` from ``parse_result``.
+    If the parser says "analysis" but no tickers are present, falls back to
+    knowledge (can't analyse without tickers).
     """
     pr = state.get("parse_result", {})
     qtype = pr.get("question_type", "knowledge")
 
     if qtype == "analysis" and pr.get("tickers"):
-        # Type A: Data-driven analysis
+        # Analysis path: data-driven answer using market/fundamental/news data
         state["question_type"] = "analysis"
         nodes = ["fetch_market_data"]
+        if pr.get("needs_fundamentals"):
+            nodes.append("fetch_fundamental_data")
         if pr.get("needs_news"):
             nodes.append("fetch_news")
 
@@ -643,24 +717,9 @@ def route_by_parse_result(state: AgentState) -> list[str] | str:
         )
         return nodes if len(nodes) > 1 else nodes[0]
 
-    elif qtype == "knowledge" and pr.get("tickers"):
-        # Type B: Knowledge question with asset context (market data as support)
-        state["question_type"] = "knowledge"
-        nodes = ["fetch_market_data", "fetch_local_knowledge"]
-        if pr.get("needs_news"):
-            nodes.append("fetch_news")
-
-        _emit_trace_sync(
-            **TraceEvent(
-                stage="route", status="completed",
-                detail=f"Question type: knowledge (with tickers) | Routing to: {', '.join(nodes)}",
-                tools=nodes,
-            ).model_dump()
-        )
-        return nodes
-
     else:
-        # Type C: Pure knowledge Q/A (local → evaluate → optional web)
+        # Knowledge path: conceptual/educational answer via KB
+        # Tickers are ignored — knowledge questions don't fetch market data
         state["question_type"] = "knowledge"
         _emit_trace_sync(
             **TraceEvent(
@@ -706,19 +765,19 @@ def route_after_sufficiency(state: AgentState) -> str:
 def build_graph() -> StateGraph:
     """Build and compile the agent graph.
 
-    Topology (LLM-determined question type + knowledge hub):
+    Two clean paths driven by parser's question_type:
         parse → question_type?
-          → Analysis (tickers):  fetch_market_data [+ fetch_news] → synthesize → END
-          → Knowledge (tickers): fetch_market_data [+ fetch_news] + fetch_local_knowledge
-                                   → evaluate_sufficiency → [fetch_web_knowledge?] → synthesize → END
-          → Knowledge (no tickers): fetch_local_knowledge → evaluate_sufficiency
-                                      → [fetch_web_knowledge?] → synthesize → END
+          → analysis (+ tickers): fetch_market_data [+ fetch_fundamental_data]
+                                    [+ fetch_news] → synthesize → END
+          → knowledge:            fetch_local_knowledge → evaluate_sufficiency
+                                    → [fetch_web_knowledge?] → synthesize → END
     """
     graph = StateGraph(AgentState)
 
     # Add nodes
     graph.add_node("parse", parse_node)
     graph.add_node("fetch_market_data", fetch_market_data_node)
+    graph.add_node("fetch_fundamental_data", fetch_fundamental_data_node)
     graph.add_node("fetch_news", fetch_news_node)
     graph.add_node("fetch_local_knowledge", fetch_local_knowledge_node)
     graph.add_node("evaluate_sufficiency", evaluate_sufficiency_node)
@@ -732,11 +791,12 @@ def build_graph() -> StateGraph:
     graph.add_conditional_edges(
         "parse",
         route_by_parse_result,
-        ["fetch_market_data", "fetch_news", "fetch_local_knowledge"],
+        ["fetch_market_data", "fetch_fundamental_data", "fetch_news", "fetch_local_knowledge"],
     )
 
     # Analysis path: fetch nodes → synthesize
     graph.add_edge("fetch_market_data", "synthesize")
+    graph.add_edge("fetch_fundamental_data", "synthesize")
     graph.add_edge("fetch_news", "synthesize")
 
     # Knowledge hub path: local → evaluate → conditional → synthesize
@@ -779,6 +839,7 @@ class FinancialQAAgent:
             "parse_result": {},
             "question_type": "",
             "market_data": "",
+            "fundamental_data": "",
             "news_data": "",
             "local_knowledge_data": "",
             "web_knowledge_data": "",
@@ -811,6 +872,7 @@ class FinancialQAAgent:
                 "parse_result": {},
                 "question_type": "",
                 "market_data": "",
+                "fundamental_data": "",
                 "news_data": "",
                 "local_knowledge_data": "",
                 "web_knowledge_data": "",

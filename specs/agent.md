@@ -1,6 +1,6 @@
 # Agent Specification
 
-**Version**: 0.6.0
+**Version**: 0.8.0
 **Last Updated**: 2026-03-04
 
 ## Overview
@@ -19,13 +19,16 @@ class ParseResult(TypedDict, total=False):
     sector: str | None           # Sector name when asset_type is "sector"
     needs_news: bool             # Whether to fetch news
     news_query: str | None       # Refined search query for Brave
-    knowledge_queries: list[str] # Conceptual sub-questions for knowledge base
+    knowledge_query: str | None   # Single RAG-optimized search query for knowledge base
+    needs_fundamentals: bool     # Whether to fetch FMP fundamental data (equity only)
+    fundamental_endpoints: list[str]  # Which data sources: financial_statement, earnings_transcript
 
 class AgentState(TypedDict):
     question: str                # Original user question
     parse_result: ParseResult    # Structured entities extracted by parse node
     question_type: str           # "analysis" (tickers present) or "knowledge" (no tickers)
     market_data: str             # Output from market data tool (empty if not called)
+    fundamental_data: str        # Output from FMP fundamental data tool (empty if not called)
     news_data: str               # Output from news search tool (empty if not called)
     local_knowledge_data: str    # Output from local ChromaDB search (empty if not called)
     web_knowledge_data: str      # Output from web knowledge search (empty if not called)
@@ -36,18 +39,18 @@ class AgentState(TypedDict):
 ## Graph Topology
 
 ```
-parse → route_by_parse_result
-         ├── tickers found (analysis):  fetch_market_data [+ fetch_news] → synthesize → END
-         └── no tickers (knowledge):    fetch_local_knowledge → evaluate_sufficiency
-                                          ├── sufficient → synthesize → END
-                                          └── insufficient → fetch_web_knowledge → synthesize → END
+parse → route_by_parse_result (driven by question_type from parser)
+         ├── analysis (+ tickers): fetch_market_data [+ fetch_fundamental_data] [+ fetch_news] → synthesize → END
+         └── knowledge:            fetch_local_knowledge → evaluate_sufficiency
+                                     ├── sufficient → synthesize → END
+                                     └── insufficient → fetch_web_knowledge → synthesize → END
 ```
 
 ## Nodes
 
 ### 1. parse (LLM call)
 - Receives the user question
-- Makes a single LLM call to extract structured entities (tickers, time period, news flag, knowledge queries, etc.)
+- Makes a single LLM call to extract structured entities (tickers, time period, news flag, knowledge query, etc.)
 - **Injects today's date** (`date.today().isoformat()`) into the prompt so the LLM can resolve relative/ambiguous dates correctly
 - LLM JSON output is validated through `ParseResultModel` (Pydantic) which provides defaults for missing fields and catches type errors, then converted to dict via `.model_dump()` for LangGraph state compatibility
 - **`time_period` constrained to valid yfinance values** — the prompt enumerates all 11 valid periods (`1d`, `5d`, `1mo`, `3mo`, `6mo`, `1y`, `2y`, `5y`, `10y`, `ytd`, `max`) and instructs the LLM to pick the smallest valid period that covers the requested range (e.g. "2 weeks" → `1mo`). `ParseResultModel` also has a `field_validator` that coerces invalid values to `None` as a safety net.
@@ -56,8 +59,22 @@ parse → route_by_parse_result
 - Returns empty `parse_result: {}` on JSON parse failure (graceful fallback)
 - Strips markdown code fences from LLM output before parsing
 
-### 2. fetch_market_data (yfinance)
-- Triggered when `parse_result.tickers` is non-empty (analysis path)
+### 2. fetch_fundamental_data (FMP API)
+- Triggered when `parse_result.needs_fundamentals` is `true` (analysis path only)
+- **Equity-only**: Guards against non-equity asset types and ticker patterns (suffixes `-USD`, `=X`, `=F`; prefix `^`)
+- Fetches from FMP free tier (250 req/day) via async httpx — **exactly 2 API calls max per ticker**
+- Endpoints controlled by `parse_result.fundamental_endpoints` (only two valid values):
+  - `financial_statement` → 1 FMP call to `/income-statement` (revenue, gross profit, operating income, net income, EPS, EBITDA)
+  - `earnings_transcript` → 1 FMP call to `/earning-call-transcript`, summarized via LLM before returning
+- **No default fallback** — if the parser doesn't set `fundamental_endpoints`, the tool returns early with a message. The parser is the explicit gatekeeper.
+- Period inference: `time_period` short values (1d, 5d, 1mo, 3mo, 6mo) → quarterly; else → annual; limit=4 records
+- Transcript handling: Transcripts are 5k-15k words. A dedicated LLM call (`_summarize_transcript`) condenses the transcript into ~300-500 words organized by: Financial Highlights, Guidance & Outlook, Strategic Updates, Risk Factors, Key Q&A Points — guided by the user's question for relevance
+- Caps at 3 tickers per question (API budget)
+- Graceful degradation: missing `FMP_API_KEY` → message, no tickers → message, non-equity → message
+- Output: Formatted text with sections per ticker (Income Statement, Earnings Call Transcript Summary)
+
+### 3. fetch_market_data (yfinance)
+- Triggered when `parse_result.tickers` is non-empty (analysis or knowledge-with-tickers paths)
 - Tickers come exclusively from parse result (LLM extraction) — no regex fallback
 - The parse LLM handles all resolution: company names → tickers, sectors → ETFs, crypto/forex/index symbols, commodities → futures
 - Supports equities (`AAPL`), crypto (`BTC-USD`), forex (`EURUSD=X`), indices (`^GSPC`), sector ETFs (`XLK`), commodities (`GC=F` gold, `CL=F` oil, `SI=F` silver, etc.)
@@ -68,22 +85,22 @@ parse → route_by_parse_result
 - Runs yfinance in a thread pool (it's synchronous)
 - Caps at 5 tickers per question
 
-### 3. fetch_news (Brave Search API)
+### 4. fetch_news (Brave Search API)
 - Triggered when `parse_result.needs_news` is `true`
 - Uses `parse_result.news_query` for a refined search query (falls back to raw question)
 - Returns top 5 results with title, description, source URL, age
 - Gracefully returns message if `BRAVE_API_KEY` is not set
 
-### 4. fetch_local_knowledge (ChromaDB)
+### 5. fetch_local_knowledge (ChromaDB)
 - Triggered on the knowledge path (no tickers in parse result)
 - Also serves as fallback when no other tools are triggered
-- Uses `knowledge_queries` from parse result for ChromaDB search (joins multiple queries); falls back to raw question
+- Uses `knowledge_query` from parse result for ChromaDB search (single RAG-optimized query); falls back to raw question
 - **Embedding**: ChromaDB's default embedding function (all-MiniLM-L6-v2 via onnxruntime, 384-dim). Both `query(query_texts=...)` and `upsert(documents=...)` embed text automatically — no explicit embedding call or external API needed.
 - Filters by distance threshold (`kb_max_distance`, default 0.5)
 - Returns formatted results with source metadata, or `"No relevant local knowledge found."`
 - Output format for web-origin docs: `[n] text\n    Reference: [Title](URL)`
 
-### 5. evaluate_sufficiency (LLM call)
+### 6. evaluate_sufficiency (LLM call)
 - Triggered after `fetch_local_knowledge` completes
 - Evaluates whether local knowledge results are sufficient to answer the user's question
 - Uses `EVALUATE_SUFFICIENCY_PROMPT` with user question + local results
@@ -92,17 +109,17 @@ parse → route_by_parse_result
 - On JSON parse failure → defaults to `"no"` (conservative: trigger web search)
 - This is a short, cheap LLM call — simple binary decision
 
-### 6. fetch_web_knowledge (Brave web search + ChromaDB storage)
+### 7. fetch_web_knowledge (Brave web search + ChromaDB storage)
 - Triggered only when `evaluate_sufficiency` returns `"no"`
-- Uses `knowledge_queries` or `news_query` from parse result for Brave web search query
+- Uses `knowledge_query` or `news_query` from parse result for Brave web search query
 - Searches Brave web API (top 3 results)
 - **Stores results in ChromaDB** for future local retrieval (auto-population)
 - **URL/title retention**: Results include title and URL metadata, stored in ChromaDB. Output format: `[n] text\n    Reference: [Title](URL)` — enables the synthesize node to include clickable source references.
 - Gracefully returns `"No relevant web results found."` if no API key or no results
 
-### 7. synthesize (LLM call)
+### 8. synthesize (LLM call)
 - Receives all non-empty tool outputs as context
-- **Derives question type from data present** — `market_data` non-empty → analysis, otherwise → knowledge. This is independent of the `question_type` field in state (routing function state mutations don't propagate in LangGraph).
+- Uses `parse_result.question_type` to select the prompt (analysis or knowledge)
 - Selects prompt based on derived question type:
   - **Analysis prompt** (market data present): Produces up to 3 sections with `##` headers:
     - `## Fact` — Question-relevant factual data only (not a raw dump of all available data). The prompt instructs the LLM to select data points that directly address the user's question and structure them as a lead-in to the analysis.
@@ -117,20 +134,19 @@ parse → route_by_parse_result
 
 ## Routing Logic
 
-Routing determines the **question type** based on whether tickers are present in the parse result. Two mutually exclusive paths:
+Routing is driven by the parser LLM's `question_type` field. Two clean, mutually exclusive paths:
 
 | Question Type | Condition | Tools | Answer Format |
 |---|---|---|---|
-| **Analysis** | `tickers` non-empty | fetch_market_data (always) + fetch_news (if `needs_news`) | Fact + Analysis + References |
-| **Knowledge** | No tickers | fetch_local_knowledge → evaluate_sufficiency → [fetch_web_knowledge] | Answer + References |
-
-The routing function sets `question_type` on the state dict for trace logging, but this mutation does not propagate to downstream nodes in LangGraph. The synthesize node independently derives the question type by checking whether `market_data` is non-empty.
+| **Analysis** | `question_type=analysis` AND `tickers` non-empty | fetch_market_data (always) + fetch_fundamental_data (if `needs_fundamentals`) + fetch_news (if `needs_news`) | Fact + Analysis + References |
+| **Knowledge** | `question_type=knowledge` OR no tickers | fetch_local_knowledge → evaluate_sufficiency → [fetch_web_knowledge] | Answer + References |
 
 **Key behaviors**:
-- `needs_news` without tickers → knowledge path (not news)
-- `knowledge_queries` with tickers → analysis path (knowledge queries ignored)
+- **Parser decides**: The parse LLM determines `question_type`. Questions about specific tickers' data, performance, reports → analysis. General concepts, history, education → knowledge.
+- **Knowledge ignores tickers**: If `question_type=knowledge`, any tickers in the parse result are ignored — no market data or fundamental data is fetched.
+- **Analysis requires tickers**: If `question_type=analysis` but no tickers extracted, falls back to knowledge path (can't analyse without data).
 - Empty parse result → knowledge path (fallback)
-- Analysis path can fan out to market_data + news in parallel (LangGraph fan-out)
+- Analysis path can fan out to market_data + fundamental_data + news in parallel (LangGraph fan-out)
 
 **Shared fields**: When multiple tickers are parsed, `time_period` uses the longest applicable span. `needs_news` is `true` if any ticker in the question warrants news retrieval.
 
@@ -150,6 +166,7 @@ Configured via environment variables / `.env`:
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `FMP_API_KEY` | (optional) | Financial Modeling Prep API (fundamental data, 250 req/day free tier) |
 | `BRAVE_API_KEY` | (optional) | Brave Search API access |
 | `CHROMA_PERSIST_DIR` | `data/chroma` | ChromaDB storage directory |
 | `CHROMA_COLLECTION_NAME` | `financial_knowledge` | ChromaDB collection name |
@@ -161,9 +178,10 @@ Configured via environment variables / `.env`:
 All structured data flowing through the pipeline is formalized in `src/financial_qa_agent/models.py` as Pydantic models:
 
 - **Market data**: `HistoryRecord`, `TickerData` (with `Field(alias="52w_high")` for Python-invalid keys)
+- **Fundamental data**: `IncomeStatementRecord`, `FundamentalData` (container with ticker, name, income statements, transcript summary)
 - **Knowledge base**: `KnowledgeResult`
 - **News search**: `NewsResult`
-- **Parse validation**: `ParseResultModel` — companion to `ParseResult` TypedDict; validates LLM output with defaults. Includes `field_validator` for `time_period` (coerce invalid to `None`), `field_validator` for `time_start`/`time_end` (enforce YYYY-MM-DD regex), and `model_validator` to clear `time_period` when `time_start` is set.
+- **Parse validation**: `ParseResultModel` — companion to `ParseResult` TypedDict; validates LLM output with defaults. Includes `field_validator` for `time_period` (coerce invalid to `None`), `field_validator` for `time_start`/`time_end` (enforce YYYY-MM-DD regex), `model_validator` to clear `time_period` when `time_start` is set, `knowledge_query: str | None` (single RAG-optimized query replacing the old `knowledge_queries` list), `needs_fundamentals: bool` + `fundamental_endpoints: list[str]` with validator filtering invalid endpoint names against `VALID_FUNDAMENTAL_ENDPOINTS` (`"financial_statement"`, `"earnings_transcript"`).
 - **Trace events**: `TraceEvent`, `ToolInputEvent`, `ToolOutputEvent`, `AnswerEvent`, `ErrorEvent`
 
 **Key constraint**: LangGraph requires `AgentState` and `ParseResult` to be `TypedDict`. Pydantic models serve as validation companions — construct model, call `.model_dump()`, insert into state. Tool functions still accept `parse_result: dict | None` for compatibility.
@@ -185,6 +203,7 @@ The agent emits trace events during execution via `contextvars.ContextVar`-based
 | `parse` | `trace(started)` → `trace(completed, detail=ticker/news/knowledge summary)` |
 | `route` | `trace(completed, detail=tool list)` |
 | `fetch_market_data` | `trace(started)` → `tool_input(market_data)` → `tool_output(market_data)` → `trace(completed)` |
+| `fetch_fundamental_data` | `trace(started)` → `tool_input(fundamental_data)` → `tool_output(fundamental_data)` → `trace(completed)` |
 | `fetch_news` | `trace(started)` → `tool_input(news_search)` → `tool_output(news_search)` → `trace(completed)` |
 | `fetch_local_knowledge` | `trace(started)` → `tool_input(local_knowledge)` → `tool_output(local_knowledge)` → `trace(completed)` |
 | `evaluate_sufficiency` | `trace(started)` → `trace(completed, detail=sufficient/insufficient + reason)` |

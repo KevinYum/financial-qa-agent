@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # Brave Search API
     brave_api_key: str = ""
 
+    # Financial Modeling Prep API (fundamental data)
+    fmp_api_key: str = ""
+
     # ChromaDB
     chroma_persist_dir: str = "data/chroma"
     chroma_collection_name: str = "financial_knowledge"

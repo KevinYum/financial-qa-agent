@@ -47,7 +47,7 @@ async def test_agent_pipeline_knowledge_route_sufficient():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": ["What is compound interest?"],
+        "knowledge_query": "compound interest mechanism and importance",
     })
 
     mock_eval_resp = MagicMock()
@@ -101,7 +101,7 @@ async def test_agent_pipeline_knowledge_route_insufficient():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": ["What are options?"],
+        "knowledge_query": "stock options financial derivatives",
     })
 
     mock_eval_resp = MagicMock()
@@ -152,7 +152,7 @@ async def test_agent_pipeline_market_data_route():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": [],
+        "knowledge_query": None,
     })
 
     mock_synth_resp = MagicMock()
@@ -193,7 +193,7 @@ async def test_agent_pipeline_news_without_tickers_goes_to_knowledge():
         "sector": None,
         "needs_news": True,
         "news_query": "Apple earnings Q4",
-        "knowledge_queries": [],
+        "knowledge_query": None,
     })
 
     mock_eval_resp = MagicMock()
@@ -240,7 +240,7 @@ async def test_agent_pipeline_date_range_query():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": [],
+        "knowledge_query": None,
     })
 
     mock_synth_resp = MagicMock()
@@ -288,7 +288,7 @@ async def test_agent_pipeline_tickers_with_news():
         "sector": None,
         "needs_news": True,
         "news_query": "Apple earnings",
-        "knowledge_queries": [],
+        "knowledge_query": None,
     })
 
     mock_synth_resp = MagicMock()
@@ -322,6 +322,55 @@ async def test_agent_pipeline_tickers_with_news():
         assert "150" in answer
 
 
+@pytest.mark.asyncio
+async def test_agent_pipeline_with_fundamentals():
+    """Full pipeline: analysis + needs_fundamentals routes to market_data + fundamental_data."""
+    mock_parse_resp = MagicMock()
+    mock_parse_resp.content = json.dumps({
+        "question_type": "analysis",
+        "tickers": ["AAPL"],
+        "company_names": ["Apple"],
+        "time_period": "1y",
+        "time_start": None,
+        "time_end": None,
+        "asset_type": "equity",
+        "sector": None,
+        "needs_news": False,
+        "news_query": None,
+        "knowledge_query": None,
+        "needs_fundamentals": True,
+        "fundamental_endpoints": ["financial_statement"],
+    })
+
+    mock_synth_resp = MagicMock()
+    mock_synth_resp.content = "Apple revenue was $394B in FY2025."
+
+    mock_llm = AsyncMock()
+    mock_llm.ainvoke = AsyncMock(
+        side_effect=[mock_parse_resp, mock_synth_resp]
+    )
+
+    with (
+        patch("src.financial_qa_agent.agent._build_llm", return_value=mock_llm),
+        patch(
+            "src.financial_qa_agent.agent.fetch_market_data",
+            new_callable=AsyncMock,
+            return_value="AAPL: $150",
+        ),
+        patch(
+            "src.financial_qa_agent.agent.fetch_fundamental_data",
+            new_callable=AsyncMock,
+            return_value="Revenue: $394B",
+        ) as mock_fund,
+    ):
+        from src.financial_qa_agent.agent import FinancialQAAgent
+
+        agent = FinancialQAAgent()
+        answer = await agent.ask("What is Apple's revenue?")
+        mock_fund.assert_called_once()
+        assert "394" in answer
+
+
 # ---------------------------------------------------------------------------
 # Parse node tests
 # ---------------------------------------------------------------------------
@@ -343,7 +392,7 @@ async def test_parse_node_extracts_entities():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": [],
+        "knowledge_query": None,
     })
 
     mock_llm = AsyncMock()
@@ -390,7 +439,7 @@ async def test_parse_node_date_range_query():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": [],
+        "knowledge_query": None,
     })
 
     mock_llm = AsyncMock()
@@ -421,7 +470,7 @@ async def test_parse_node_date_range_overrides_period():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": [],
+        "knowledge_query": None,
     })
 
     mock_llm = AsyncMock()
@@ -446,7 +495,7 @@ async def test_parse_node_strips_markdown_fencing():
         '{"tickers": [], "company_names": [], "time_period": null, '
         '"time_start": null, "time_end": null, "asset_type": null, '
         '"sector": null, "needs_news": true, "news_query": "Tesla news", '
-        '"knowledge_queries": []}\n'
+        '"knowledge_query": null}\n'
         '```'
     )
 
@@ -515,8 +564,8 @@ def test_route_analysis_tickers_without_news():
     assert state["question_type"] == "analysis"
 
 
-def test_route_knowledge_with_tickers():
-    """Knowledge + tickers routes to market_data + local_knowledge (both)."""
+def test_route_knowledge_ignores_tickers():
+    """Knowledge question_type ignores tickers — routes to knowledge path."""
     from src.financial_qa_agent.agent import route_by_parse_result
 
     state = {
@@ -528,30 +577,25 @@ def test_route_knowledge_with_tickers():
         "question_type": "",
     }
     result = route_by_parse_result(state)
-    assert isinstance(result, list)
-    assert "fetch_market_data" in result
-    assert "fetch_local_knowledge" in result
-    assert "fetch_news" in result
+    # Knowledge path: tickers ignored, goes to local knowledge
+    assert result == "fetch_local_knowledge"
     assert state["question_type"] == "knowledge"
 
 
-def test_route_knowledge_with_tickers_no_news():
-    """Knowledge + tickers without news routes to market_data + local_knowledge."""
+def test_route_analysis_without_tickers_falls_back_to_knowledge():
+    """Analysis without tickers falls back to knowledge path (can't analyse without data)."""
     from src.financial_qa_agent.agent import route_by_parse_result
 
     state = {
         "parse_result": {
-            "question_type": "knowledge",
-            "tickers": ["AAPL"],
+            "question_type": "analysis",
+            "tickers": [],
             "needs_news": False,
         },
         "question_type": "",
     }
     result = route_by_parse_result(state)
-    assert isinstance(result, list)
-    assert "fetch_market_data" in result
-    assert "fetch_local_knowledge" in result
-    assert "fetch_news" not in result
+    assert result == "fetch_local_knowledge"
     assert state["question_type"] == "knowledge"
 
 
@@ -562,7 +606,7 @@ def test_route_knowledge_without_tickers():
     state = {
         "parse_result": {
             "question_type": "knowledge",
-            "knowledge_queries": ["What is a bond?"],
+            "knowledge_query": "bond fixed income instrument",
         },
         "question_type": "",
     }
@@ -587,6 +631,63 @@ def test_route_no_parse_result_key_fallback():
 
     state = {"question_type": ""}
     result = route_by_parse_result(state)
+    assert result == "fetch_local_knowledge"
+    assert state["question_type"] == "knowledge"
+
+
+def test_route_analysis_with_fundamentals():
+    """Analysis + tickers + needs_fundamentals routes to market_data + fundamental_data."""
+    from src.financial_qa_agent.agent import route_by_parse_result
+
+    state = {
+        "parse_result": {
+            "question_type": "analysis",
+            "tickers": ["AAPL"],
+            "needs_fundamentals": True,
+            "fundamental_endpoints": ["financial_statement"],
+        },
+        "question_type": "",
+    }
+    result = route_by_parse_result(state)
+    assert isinstance(result, list)
+    assert "fetch_market_data" in result
+    assert "fetch_fundamental_data" in result
+
+
+def test_route_analysis_without_fundamentals():
+    """Analysis without needs_fundamentals does not include fundamental_data."""
+    from src.financial_qa_agent.agent import route_by_parse_result
+
+    state = {
+        "parse_result": {
+            "question_type": "analysis",
+            "tickers": ["AAPL"],
+            "needs_fundamentals": False,
+        },
+        "question_type": "",
+    }
+    result = route_by_parse_result(state)
+    if isinstance(result, list):
+        assert "fetch_fundamental_data" not in result
+    else:
+        assert result == "fetch_market_data"
+
+
+def test_route_knowledge_with_tickers_and_fundamentals_ignores_all():
+    """Knowledge + tickers + fundamentals still goes to knowledge (tickers ignored)."""
+    from src.financial_qa_agent.agent import route_by_parse_result
+
+    state = {
+        "parse_result": {
+            "question_type": "knowledge",
+            "tickers": ["AAPL"],
+            "needs_fundamentals": True,
+            "fundamental_endpoints": ["financial_statement"],
+        },
+        "question_type": "",
+    }
+    result = route_by_parse_result(state)
+    # Knowledge path: all ticker-related fields ignored
     assert result == "fetch_local_knowledge"
     assert state["question_type"] == "knowledge"
 
@@ -707,7 +808,7 @@ async def test_ask_with_trace_emits_events():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": ["What is a stock?"],
+        "knowledge_query": "stock equity ownership",
     })
 
     mock_eval_resp = MagicMock()
@@ -783,7 +884,7 @@ async def test_ask_without_trace_is_noop():
         "sector": None,
         "needs_news": False,
         "news_query": None,
-        "knowledge_queries": ["What is a bond?"],
+        "knowledge_query": "bond fixed income instrument",
     })
 
     mock_eval_resp = MagicMock()
@@ -889,8 +990,8 @@ async def test_synthesize_uses_knowledge_prompt():
 
 
 @pytest.mark.asyncio
-async def test_synthesize_knowledge_with_market_data():
-    """Knowledge question with tickers uses knowledge prompt even with market data present."""
+async def test_synthesize_knowledge_prompt_selection():
+    """Knowledge question_type uses knowledge prompt regardless of state contents."""
     from src.financial_qa_agent.agent import synthesize_node
 
     mock_resp = MagicMock()
@@ -904,20 +1005,18 @@ async def test_synthesize_knowledge_with_market_data():
             "question": "Why did gold rise recently?",
             "parse_result": {"question_type": "knowledge"},
             "question_type": "",
-            "market_data": "=== Gold (GC=F) ===\nCurrent Price: $2800",
-            "news_data": "Gold hits record high amid uncertainty",
+            "market_data": "",
+            "news_data": "",
             "local_knowledge_data": "Gold factors: inflation, geopolitics.",
-            "web_knowledge_data": "",
+            "web_knowledge_data": "Gold hits record amid uncertainty.",
         }
         result = await synthesize_node(state)
 
-        # Should use knowledge prompt despite market_data being present
+        # Should use knowledge prompt
         call_args = mock_llm.ainvoke.call_args[0][0]
         prompt_text = call_args[0].content
         assert "financial education" in prompt_text
         assert "## Answer" in prompt_text
-        # Market data should still be included as context
-        assert "Gold (GC=F)" in prompt_text
         assert result["answer"] == mock_resp.content
 
 

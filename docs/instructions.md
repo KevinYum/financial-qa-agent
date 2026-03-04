@@ -670,3 +670,223 @@ This gives the reader a scannable metrics block and a glanceable answer before t
 - All 90 tests passing
 
 ---
+
+## v0.0.24 — 2026-03-04 — FMP Fundamental Data: Financial Statements + Earnings Transcripts
+
+**Instruction**:
+> now I want to extend the market data part ability to have fundamental data provider (including fiscal report):
+> 1. data provider is fmp free tier, I can config api key later
+> 2. the parser should return whether user request require fundamental data (if you are supporting multiple fundamental data api, you should further ask parser to give particular api args), fiscal statement is a must to support in fundamental, you can evaluate the necessity of others
+> 3. the fundamental data is a different kind of market data, in UI it should be along with the current price data, and like the knowledge having two section (indicate price data and fundamental data) to show what is going on
+>
+> Follow-up: let's only start with two fundamental data source 1. latest financial statement 2. latest earning transcript. For transcripts (5k-15k words), summarize via LLM first.
+
+**Design Decisions**:
+1. **FMP free tier (250 req/day)** — Financial Modeling Prep provides financial statements (income statement, balance sheet, cash flow) and earnings call transcripts. All endpoints are accessible on the free tier. Configured via `FMP_API_KEY` env var with graceful degradation when missing.
+2. **Parser-driven endpoint selection** — Two new parse result fields: `needs_fundamentals: bool` and `fundamental_endpoints: list[str]`. The parse LLM determines whether the question requires fundamental data and which specific endpoints to call (`income_statement`, `balance_sheet`, `cash_flow`, `earnings_transcript`). A Pydantic validator filters invalid endpoint names against `VALID_FUNDAMENTAL_ENDPOINTS`.
+3. **Equity-only guard** — FMP data is only available for equities. Dual guard: the parse prompt instructs `needs_fundamentals=false` for non-equity assets, and the tool filters out non-equity tickers by suffix (`-USD`, `=X`, `=F`) and prefix (`^`), plus checks `asset_type`.
+4. **Earnings transcript summarization** — Transcripts are 5k-15k words, too long for direct inclusion. A dedicated LLM call (`_summarize_transcript`) condenses the transcript into ~300-500 words organized by: Financial Highlights, Guidance & Outlook, Strategic Updates, Risk Factors, Key Q&A Points — guided by the user's question for relevance.
+5. **Period inference** — Financial statements use `time_period` to choose annual vs quarterly (short periods like 1d/5d/1mo/3mo/6mo → quarterly; else → annual; limit=4 records). Transcript quarter/year inferred from `time_end`/`time_start` or defaults to most recently completed quarter.
+6. **8-node graph** — Added `fetch_fundamental_data` node. Triggered on both analysis and knowledge-with-tickers paths when `needs_fundamentals=True`. Runs in parallel with other fetch nodes via LangGraph fan-out.
+7. **Market Data sub-sections** — Frontend reuses the Knowledge tab's sub-section pattern (`TOOL_SECTION_LABEL` + `getToolContainer()`) for the Market Data tab: "Price Data" (yfinance) and "Fundamental Data" (FMP) sub-sections.
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/config.py` — added `fmp_api_key: str = ""`
+- Updated `.env.example` — added `FMP_API_KEY=` template entry
+- Updated `src/financial_qa_agent/models.py`:
+  - Added `IncomeStatementRecord`, `BalanceSheetRecord`, `CashFlowRecord`, `FundamentalData` models
+  - Added `VALID_FUNDAMENTAL_ENDPOINTS` frozenset
+  - Added `needs_fundamentals: bool = False`, `fundamental_endpoints: list[str] = []` to `ParseResultModel`
+  - Added `validate_fundamental_endpoints` field validator
+- Created `src/financial_qa_agent/tools/fundamental_data.py` (new file):
+  - `fetch_fundamental_data()` — main public API with equity-only guards
+  - `_fetch_fmp_json()` — generic async httpx GET for FMP endpoints
+  - `_map_income_statement()`, `_map_balance_sheet()`, `_map_cash_flow()` — FMP JSON → Pydantic
+  - `_format_fundamental_data()` — concise text formatter with `_fmt_dollar()` (B/M notation)
+  - `_summarize_transcript()` — LLM call to summarize earnings transcripts
+  - `_resolve_period_and_limit()`, `_resolve_transcript_quarter_year()` — period/quarter inference
+  - `_is_equity_ticker()` — filter non-equity tickers by suffix/prefix
+- Updated `src/financial_qa_agent/tools/__init__.py` — registered `fetch_fundamental_data`
+- Updated `src/financial_qa_agent/agent.py`:
+  - Added `needs_fundamentals`, `fundamental_endpoints` to `ParseResult` TypedDict
+  - Added `fundamental_data: str` to `AgentState` TypedDict
+  - Updated `PARSE_PROMPT` with `needs_fundamentals` + `fundamental_endpoints` instructions
+  - Added `fetch_fundamental_data_node()` with trace events
+  - Updated `route_by_parse_result()` — analysis and knowledge-with-tickers paths add fundamental_data when `needs_fundamentals=True`
+  - Updated `build_graph()` — 8 nodes, `fetch_fundamental_data` → `synthesize` edge
+  - Updated `synthesize_node()` — includes `fundamental_data` in context
+  - Updated `SYNTHESIZE_ANALYSIS_PROMPT` — mentions fundamental data availability
+  - Updated initial state in `ask()` and `ask_with_trace()` — `"fundamental_data": ""`
+- Updated `frontend/app.js`:
+  - Added `fundamental_data: "tab-market-data"` to `TOOL_TAB_MAP`
+  - Added `market_data: "Price Data"`, `fundamental_data: "Fundamental Data"` to `TOOL_SECTION_LABEL`
+- Updated `frontend/index.html` — Market Data tab placeholder text updated
+- Added 19 tests:
+  - 7 tool tests: no API key, no tickers, non-equity rejected, commodity filtered, income statement, endpoint selection, earnings transcript
+  - 8 model tests: record construction, defaults, endpoint validation
+  - 4 agent tests: pipeline with fundamentals, routing with/without fundamentals
+- All 109 tests passing (7 API + 38 agent + 39 models + 25 tools)
+- Updated `specs/agent.md` — 8-node graph, new state fields, fundamental_data node, routing table, trace events, tool config (v0.7.0)
+- Updated `specs/architecture.md` — 8-node agent, FMP external service, fundamental data models, tool list (v0.7.0)
+- Updated `README.md` — system architecture diagram (FMP node + external service), agent loop diagram, interaction pattern, project structure, tech stack, test counts
+- Updated `CLAUDE.md` — tech stack (FMP), project structure (fundamental_data.py)
+
+---
+
+## v0.0.25 — 2026-03-04 — Simplify Fundamental Endpoints to Two Data Sources
+
+**Instruction**:
+> it seems fundamental data is not really fetched, and why they are not in the parsed result those "income_statement", "balance_sheet", "cash_flow"
+> I believe I told you to only support financial statement and earning script first and parser should have field indicating whether or not user request need such information
+
+**Root Cause**:
+Two issues:
+1. The parser was instructed to choose between four granular endpoints (`income_statement`, `balance_sheet`, `cash_flow`, `earnings_transcript`) when the user only wanted two data source categories: "financial statement" (all three statement types as one unit) and "earnings transcript".
+2. The tool had a default fallback (`or ["income_statement", "balance_sheet", "cash_flow"]`) that would run all endpoints even when the parser didn't explicitly set them — defeating the purpose of parser-driven control.
+3. When FMP API returned empty data (e.g., invalid/missing API key), the tool silently returned just the header with no error feedback.
+
+**Design Decisions**:
+1. **Two data sources, not four** — `VALID_FUNDAMENTAL_ENDPOINTS` simplified from `{"income_statement", "balance_sheet", "cash_flow", "earnings_transcript"}` to `{"financial_statement", "earnings_transcript"}`. The `financial_statement` endpoint fetches all three FMP statement APIs (income, balance sheet, cash flow) as a single atomic unit. The parser picks between these two high-level data sources.
+2. **No default fallback** — If the parser doesn't set `fundamental_endpoints`, the tool returns `"No fundamental data endpoints requested by parser."` instead of silently fetching everything. The parser is the explicit gatekeeper.
+3. **Error feedback** — When FMP returns empty data for any sub-endpoint, the tool appends a `[Note: Some data could not be retrieved: ...]` message so users can see what failed.
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/models.py`:
+  - Changed `VALID_FUNDAMENTAL_ENDPOINTS` from 4 values to 2: `{"financial_statement", "earnings_transcript"}`
+- Updated `src/financial_qa_agent/agent.py`:
+  - Rewrote `fundamental_endpoints` instructions in `PARSE_PROMPT` for two data sources with clear examples
+- Updated `src/financial_qa_agent/tools/fundamental_data.py`:
+  - Removed default fallback; empty endpoints → early return with message
+  - `"financial_statement"` triggers all 3 FMP statement endpoints as one unit
+  - Added `fetch_errors` tracking for empty responses and exceptions
+  - Appends `[Note: ...]` with error details when data retrieval partially fails
+- Updated tests:
+  - `test_fundamental_data_income_statement` → uses `"financial_statement"` endpoint
+  - `test_fundamental_data_selects_requested_endpoints` → verifies 3 FMP calls for `"financial_statement"`
+  - Added `test_fundamental_data_no_endpoints_requested` — verifies early return
+  - Updated model tests for new valid endpoint names
+  - Updated agent tests to use `"financial_statement"` in parse result mocks
+- All 110 tests passing (7 API + 38 agent + 39 models + 26 tools)
+- Updated `specs/agent.md` — fundamental_endpoints description (two values, no default fallback)
+
+---
+
+## v0.0.26 — 2026-03-04 — FMP Stable API Migration (Fix 403 Forbidden)
+
+**Instruction**:
+> [User reported 403 Forbidden errors on all FMP API calls with a valid free-tier API key]
+> try to debug this? the api key is okay but it is only free tier
+
+**Root Cause**:
+FMP deprecated the legacy `/api/v3/` endpoints after August 31, 2025. Free-tier API keys can no longer access the old URLs. The new stable API lives at `https://financialmodelingprep.com/stable` with a different URL format:
+- Base URL: `/api/v3` → `/stable`
+- Symbol parameter: path param (`/income-statement/{ticker}`) → query param (`/income-statement?symbol=AAPL`)
+- Endpoint path changes: `/cash-flow-statement` → `/cashflow-statement` (no hyphen), `/earning_call_transcript/{ticker}` → `/earning-call-transcript` (hyphens not underscores, no path param)
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/tools/fundamental_data.py`:
+  - Changed `FMP_BASE_URL` from `"https://financialmodelingprep.com/api/v3"` to `"https://financialmodelingprep.com/stable"`
+  - Changed `_ENDPOINT_PATHS`: removed `{ticker}` placeholders, updated `cash_flow` to `/cashflow-statement`
+  - Financial statement calls now pass `{"symbol": ticker}` as query param instead of interpolating ticker into URL path
+  - Transcript endpoint changed from `/earning_call_transcript/{ticker}` to `/earning-call-transcript` with `{"symbol": ticker}` query param
+- All 110 tests passing (no test changes needed — tests mock httpx responses)
+
+---
+
+## v0.0.27 — 2026-03-04 — Simplify Routing: Remove Knowledge-with-Tickers Hybrid Path
+
+**Instruction**:
+> stop the current complex orchestration, it is simple:
+> 1. if it is knowledge, just ignore all tickers parsed out
+> but as long as user concern about particular ticker's performance and report etc. it should be analysis not knowledge
+> don't use ticker to check whether analysis, allow parser llm to respond whether it is analysis, if is not, ignore the parsed out ticker field
+
+**Root Cause**:
+The "knowledge with tickers" hybrid path (routing to `fetch_market_data` + `fetch_local_knowledge` + `fetch_fundamental_data` + `fetch_news` simultaneously) caused LangGraph fan-out/fan-in issues: some branches had direct edges to `synthesize` while others went through `evaluate_sufficiency` first, causing `synthesize` to run twice and producing duplicate answers.
+
+**Design Decisions**:
+1. **Two clean paths, no hybrid** — Analysis path (parser says analysis + tickers present): market_data + optional fundamental_data + optional news → synthesize. Knowledge path (parser says knowledge): local_knowledge → evaluate_sufficiency → optional web_knowledge → synthesize.
+2. **Parser LLM decides question_type** — Routing respects the parser's `question_type` field. If knowledge, tickers are ignored entirely (no market data, no fundamental data). If analysis but no tickers, falls back to knowledge (can't analyse without data).
+3. **Sharper analysis vs knowledge distinction** — Parse prompt updated: questions about a ticker's data, performance, reports, financials → analysis. General concepts, history, education → knowledge.
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/agent.py`:
+  - Simplified `route_by_parse_result()`: removed knowledge-with-tickers branch. Two paths: `question_type=analysis` + tickers → analysis, else → knowledge.
+  - Updated `PARSE_PROMPT` `question_type` section: clearer examples, explicit note that knowledge tickers are ignored.
+  - Updated `synthesize_node` docstring.
+  - Updated `build_graph` docstring.
+- Updated tests in `tests/test_agent.py`:
+  - `test_route_knowledge_with_tickers` → `test_route_knowledge_ignores_tickers`: verifies knowledge + tickers → knowledge path
+  - `test_route_knowledge_with_tickers_no_news` → `test_route_analysis_without_tickers_falls_back_to_knowledge`: verifies analysis + no tickers → knowledge fallback
+  - `test_route_knowledge_with_tickers_and_fundamentals` → `test_route_knowledge_with_tickers_and_fundamentals_ignores_all`: verifies all ticker fields ignored
+  - `test_synthesize_knowledge_with_market_data` → `test_synthesize_knowledge_prompt_selection`: updated to reflect that knowledge won't have market_data
+- All 110 tests passing
+- Updated `specs/agent.md` (v0.8.0): graph topology, routing logic table, synthesize node description
+- Updated `README.md`: agent loop diagram, interaction pattern description
+
+---
+
+## v0.0.28 — 2026-03-04 — Simplify FMP to Exactly 2 API Calls
+
+**Instruction**:
+> I told you only to support "financial_statement", "earnings_transcript" those two FMP api, why you are calling other api in FMP
+> you should only call two api, find the right one! One is for financial statement, and one is for earning
+> it is a demo project, I just want to get some data for some purpose, it is okay data not complete
+
+**Root Cause**:
+The `financial_statement` data source was internally making 3 separate FMP API calls (income statement, balance sheet, cash flow) when the user only wanted 2 total API calls: one for financial statements, one for earnings transcripts. FMP has no single combined endpoint for all financial statements, so the solution is to use income statement only as the proxy for `financial_statement`.
+
+**Design Decisions**:
+1. **2 API calls max per ticker** — `financial_statement` → 1 call to `/income-statement`. `earnings_transcript` → 1 call to `/earning-call-transcript`. No balance sheet or cash flow calls.
+2. **Removed BalanceSheetRecord and CashFlowRecord** — No longer needed. `FundamentalData` model simplified to `income_statements` + `transcript_summary` only.
+3. **Income statement as proxy** — For a demo project, the income statement (revenue, gross profit, operating income, net income, EPS, EBITDA) provides sufficient financial data without needing balance sheet or cash flow.
+
+**Actions Taken**:
+- Rewrote `src/financial_qa_agent/tools/fundamental_data.py`:
+  - Removed `_FINANCIAL_STATEMENT_PATHS` dict and balance sheet/cash flow loop
+  - `financial_statement` → single `_fetch_fmp_json("/income-statement", ...)` call
+  - Removed `_map_balance_sheet()`, `_map_cash_flow()` mappers
+  - Removed balance sheet and cash flow sections from `_format_fundamental_data()`
+  - Removed `BalanceSheetRecord`, `CashFlowRecord` imports
+- Updated `src/financial_qa_agent/models.py`:
+  - Removed `BalanceSheetRecord` and `CashFlowRecord` classes
+  - Simplified `FundamentalData`: removed `balance_sheets` and `cash_flows` fields
+- Updated `tests/test_models.py`:
+  - Removed `BalanceSheetRecord` and `CashFlowRecord` imports and tests
+  - Updated `test_fundamental_data_defaults` assertions
+- Updated `tests/test_tools.py`:
+  - `test_fundamental_data_selects_requested_endpoints` now expects 1 FMP call (not 3)
+- All 108 tests passing (7 API + 38 agent + 37 models + 26 tools)
+- Updated `specs/agent.md`: fundamental_data node description (2 API calls, income statement only)
+
+---
+
+## v0.0.29 — 2026-03-04 — Single RAG-Optimized Knowledge Query
+
+**Instruction**:
+> adjust the parsing node, if it is a knowledge query, should only output one query not the list, and the query should be tailored to some standard or tune that will be good to do the document fetch (the RAG)
+
+**Rationale**:
+The old `knowledge_queries: list[str]` approach had the parse LLM generate multiple sub-questions which were then joined with spaces for ChromaDB search. This produced suboptimal embedding queries — joining multiple questions creates a diluted semantic signal. A single, concise, keyword-rich query tailored for document retrieval (RAG) produces better cosine similarity matches in ChromaDB.
+
+**Design Decisions**:
+1. **Single string replaces list** — `knowledge_queries: list[str]` → `knowledge_query: str | None`. The parse prompt now instructs the LLM to produce one concise, RAG-optimized query.
+2. **RAG-optimized rewriting** — The prompt guides the LLM to strip conversational filler and produce keyword-rich queries: e.g. "Can you explain how compound interest works?" → "compound interest mechanism and importance".
+3. **Null for non-knowledge paths** — `knowledge_query` is `None` when `question_type` is "analysis" (no knowledge base search needed).
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/models.py`:
+  - `ParseResultModel.knowledge_queries: list[str] = []` → `knowledge_query: str | None = None`
+- Updated `src/financial_qa_agent/agent.py`:
+  - `ParseResult` TypedDict: `knowledge_queries: list[str]` → `knowledge_query: str | None`
+  - `PARSE_PROMPT`: Rewrote instruction for single RAG-optimized query with examples
+  - JSON template: `"knowledge_queries": [...]` → `"knowledge_query": ...`
+  - Trace detail, local knowledge node, web knowledge node: all updated to use `knowledge_query`
+- Updated `src/financial_qa_agent/tools/knowledge_base.py`:
+  - `fetch_local_knowledge()`: `parse_result.get("knowledge_queries")` list join → `parse_result.get("knowledge_query")` direct string
+  - `fetch_web_knowledge()`: same change
+- Updated all tests (test_agent.py, test_tools.py, test_models.py): `knowledge_queries` → `knowledge_query`
+- Updated `specs/agent.md`: ParseResult schema, parse node, knowledge nodes, data models
+- All 108 tests passing
+
+---

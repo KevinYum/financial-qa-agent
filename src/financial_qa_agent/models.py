@@ -48,6 +48,33 @@ class TickerData(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Fundamental Data (tools/fundamental_data.py)
+# ---------------------------------------------------------------------------
+
+
+class IncomeStatementRecord(BaseModel):
+    """Single-period income statement from FMP."""
+
+    date: str
+    period: str  # "FY" or "Q1"/"Q2"/"Q3"/"Q4"
+    revenue: float | None = None
+    gross_profit: float | None = None
+    operating_income: float | None = None
+    net_income: float | None = None
+    eps: float | None = None
+    ebitda: float | None = None
+
+
+class FundamentalData(BaseModel):
+    """Aggregated fundamental data for a single ticker."""
+
+    ticker: str
+    name: str
+    income_statements: list[IncomeStatementRecord] = []
+    transcript_summary: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Knowledge Base (tools/knowledge_base.py)
 # ---------------------------------------------------------------------------
 
@@ -83,6 +110,10 @@ VALID_TIME_PERIODS = frozenset({
     "1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max",
 })
 
+VALID_FUNDAMENTAL_ENDPOINTS = frozenset({
+    "financial_statement", "earnings_transcript",
+})
+
 
 class ParseResultModel(BaseModel):
     """Pydantic companion for the ParseResult TypedDict.
@@ -101,7 +132,9 @@ class ParseResultModel(BaseModel):
     sector: str | None = None
     needs_news: bool = False
     news_query: str | None = None
-    knowledge_queries: list[str] = []
+    knowledge_query: str | None = None
+    needs_fundamentals: bool = False
+    fundamental_endpoints: list[str] = []
 
     @field_validator("question_type")
     @classmethod
@@ -110,6 +143,12 @@ class ParseResultModel(BaseModel):
         if v not in ("analysis", "knowledge"):
             return "knowledge"
         return v
+
+    @field_validator("fundamental_endpoints")
+    @classmethod
+    def validate_fundamental_endpoints(cls, v: list[str]) -> list[str]:
+        """Filter out invalid fundamental endpoint names."""
+        return [ep for ep in v if ep in VALID_FUNDAMENTAL_ENDPOINTS]
 
     @field_validator("time_period")
     @classmethod

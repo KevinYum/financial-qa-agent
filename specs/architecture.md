@@ -1,6 +1,6 @@
 # Architecture Specification
 
-**Version**: 0.6.0
+**Version**: 0.7.0
 **Last Updated**: 2026-03-04
 
 ## Overview
@@ -17,11 +17,11 @@ A financial QA agent with a LangGraph-orchestrated pipeline, two-type question r
 
 ### Agent (LangGraph)
 - **File**: `src/financial_qa_agent/agent.py`
-- **Orchestrator**: LangGraph `StateGraph` with 7 nodes
+- **Orchestrator**: LangGraph `StateGraph` with 8 nodes
 - **LLM**: `langchain-openai` `ChatOpenAI` — works with OpenAI and OpenRouter via `base_url`
-- **State**: `AgentState(TypedDict)` — question, parse_result, question_type, market_data, news_data, local_knowledge_data, web_knowledge_data, knowledge_sufficient, answer
+- **State**: `AgentState(TypedDict)` — question, parse_result, question_type, market_data, fundamental_data, news_data, local_knowledge_data, web_knowledge_data, knowledge_sufficient, answer
 - **Pipeline**: parse → two-type route:
-  - Analysis: fetch_market_data [+ fetch_news] → synthesize → return
+  - Analysis: fetch_market_data [+ fetch_fundamental_data] [+ fetch_news] → synthesize → return
   - Knowledge Hub: fetch_local_knowledge → evaluate_sufficiency → [fetch_web_knowledge if insufficient] → synthesize → return
 - **Question types**: analysis (tickers present → data summary + analysis) | knowledge (no tickers → answer + references)
 - **Tracing**: `contextvars.ContextVar`-based trace queue; nodes emit events via `_emit_trace()` / `_emit_trace_sync()`
@@ -30,16 +30,18 @@ A financial QA agent with a LangGraph-orchestrated pipeline, two-type question r
 - **File**: `src/financial_qa_agent/models.py`
 - **Purpose**: Centralized Pydantic models for all structured data flowing through the pipeline
 - **Market data**: `HistoryRecord` (OHLCV), `TickerData` (fundamentals + history, with `52w_high`/`52w_low` alias handling)
+- **Fundamental data**: `IncomeStatementRecord`, `BalanceSheetRecord`, `CashFlowRecord`, `FundamentalData` (container model)
 - **Knowledge base**: `KnowledgeResult` (text + source + title)
 - **News search**: `NewsResult` (title, description, url, age)
-- **Parse validation**: `ParseResultModel` — validates LLM JSON output with defaults, companion to `ParseResult` TypedDict. Includes `field_validator` that coerces invalid `time_period` values to `None` (safety net for LLM hallucinations like `"2w"`).
+- **Parse validation**: `ParseResultModel` — validates LLM JSON output with defaults, companion to `ParseResult` TypedDict. Includes `field_validator` that coerces invalid `time_period` values to `None` (safety net for LLM hallucinations like `"2w"`), `needs_fundamentals` + `fundamental_endpoints` with endpoint validation.
 - **Trace events**: `TraceEvent`, `ToolInputEvent`, `ToolOutputEvent`, `AnswerEvent`, `ErrorEvent` — typed event models for SSE protocol
 - **Key design**: LangGraph requires `TypedDict` state; Pydantic models serve as validation companions (construct → `.model_dump()` → state)
 
 ### Tools (`src/financial_qa_agent/tools/`)
 1. **market_data.py** — yfinance: OHLCV, fundamentals (tickers from parse node, no regex fallback). Constructs `TickerData` and `HistoryRecord` models, returns `.model_dump(by_alias=True)`.
-2. **news_search.py** — Brave Search API: recent financial news. Constructs `NewsResult` models for structured formatting.
-3. **knowledge_base.py** — Two public functions:
+2. **fundamental_data.py** — FMP API: financial statements (income statement, balance sheet, cash flow) + earnings call transcripts. Equity-only with ticker/asset_type guards. Transcripts are summarized via LLM before returning. Constructs `FundamentalData`, `IncomeStatementRecord`, `BalanceSheetRecord`, `CashFlowRecord` models.
+3. **news_search.py** — Brave Search API: recent financial news. Constructs `NewsResult` models for structured formatting.
+4. **knowledge_base.py** — Two public functions:
    - `fetch_local_knowledge` — ChromaDB vector search only (semantic cosine distance, threshold filtering). Constructs `KnowledgeResult` models.
    - `fetch_web_knowledge` — Brave web search, stores results in ChromaDB for future local retrieval (auto-population), URL/title metadata retention. Constructs `KnowledgeResult` models.
 
@@ -50,11 +52,12 @@ All tools include DEBUG-level logging for backend observability.
 - **Purpose**: Demo UI with two-panel layout — chat (left) + trace (right)
 - **No build step** — plain HTML, CSS, and JS files
 - **Communicates with backend via SSE stream (`POST /api/ask/stream`)**
-- **Trace panel**: 5 tabs — Agent Loop, Market Data, News Search, Local Knowledge, Web Knowledge
+- **Trace panel**: 4 tabs — Agent Loop, Market Data (with Price Data + Fundamental Data sub-sections), News, Knowledge (with Local Knowledge + Online Knowledge sub-sections)
 - **Progressive updates**: SSE events update the trace panel in real-time during pipeline execution
 
 ## External Services
-- **LLM API** (OpenAI or OpenRouter) — used for parse + synthesize nodes
+- **LLM API** (OpenAI or OpenRouter) — used for parse + synthesize + transcript summarization nodes
+- **Financial Modeling Prep (FMP)** — used by fundamental_data tool for financial statements + earnings transcripts (free tier, 250 req/day)
 - **Brave Search API** — used by news_search tool and knowledge_base fallback
 - **Yahoo Finance** — used by market_data tool (no API key required)
 
@@ -65,7 +68,7 @@ All tools include DEBUG-level logging for backend observability.
 ```
 User (browser) → app.js → POST /api/ask/stream → FastAPI → LangGraph agent:
   parse (LLM) → route by question type:
-    Analysis (tickers): fetch_market_data [+ fetch_news] → synthesize (data + analysis)
+    Analysis (tickers): fetch_market_data [+ fetch_fundamental_data] [+ fetch_news] → synthesize (data + analysis)
     Knowledge (no tickers): fetch_local_knowledge → evaluate_sufficiency (LLM)
                               ├── sufficient → synthesize (answer + references)
                               └── insufficient → fetch_web_knowledge → synthesize (answer + references)

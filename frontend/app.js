@@ -18,13 +18,16 @@ const tabPanes = document.querySelectorAll(".tab-pane");
 // Map SSE tool names → tab pane IDs
 const TOOL_TAB_MAP = {
   market_data: "tab-market-data",
+  fundamental_data: "tab-market-data",
   news_search: "tab-news-search",
   local_knowledge: "tab-knowledge",
   web_knowledge: "tab-knowledge",
 };
 
-// Sub-section labels within the merged Knowledge tab
+// Sub-section labels for tabs with multiple tools
 const TOOL_SECTION_LABEL = {
+  market_data: "Price Data",
+  fundamental_data: "Fundamental Data",
   local_knowledge: "Local Knowledge",
   web_knowledge: "Online Knowledge",
 };

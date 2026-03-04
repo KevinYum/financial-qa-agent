@@ -118,7 +118,7 @@ async def fetch_local_knowledge(
     """Query the local ChromaDB knowledge base (no web fallback).
 
     Strategy:
-    1. Use knowledge_queries from parse result if available, else raw question
+    1. Use knowledge_query from parse result if available, else raw question
     2. Query ChromaDB for similar documents (semantic search, cosine distance)
     3. Filter by distance threshold
     4. Return formatted results for LLM consumption
@@ -126,14 +126,9 @@ async def fetch_local_knowledge(
     parse_result = parse_result or {}
     collection = _get_collection()
 
-    # Use parsed knowledge queries if available, otherwise raw question
-    queries = parse_result.get("knowledge_queries") or [question]
-    query_text = " ".join(queries) if len(queries) > 1 else queries[0]
-    logger.debug(
-        "Local knowledge query: %r (from %d sub-queries)",
-        query_text[:100],
-        len(queries),
-    )
+    # Use parsed knowledge query if available, otherwise raw question
+    query_text = parse_result.get("knowledge_query") or question
+    logger.debug("Local knowledge query: %r", query_text[:100])
 
     results = collection.query(query_texts=[query_text], n_results=settings.kb_max_results)
 
@@ -180,7 +175,7 @@ async def fetch_web_knowledge(
     """Search the web for knowledge and store results in ChromaDB.
 
     Strategy:
-    1. Build search query from parse result (news_query or knowledge_queries)
+    1. Build search query from parse result (knowledge_query or news_query)
     2. Call Brave web search API
     3. Store results in ChromaDB for future local retrieval
     4. Return formatted results with source references
@@ -189,8 +184,7 @@ async def fetch_web_knowledge(
     collection = _get_collection()
 
     # Build query from parse result
-    queries = parse_result.get("knowledge_queries") or [question]
-    query_text = " ".join(queries) if len(queries) > 1 else queries[0]
+    query_text = parse_result.get("knowledge_query") or question
     fallback_query = parse_result.get("news_query") or query_text
 
     logger.debug("Web knowledge search: %r", fallback_query)

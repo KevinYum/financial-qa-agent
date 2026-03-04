@@ -5,7 +5,9 @@ import pytest
 from src.financial_qa_agent.models import (
     AnswerEvent,
     ErrorEvent,
+    FundamentalData,
     HistoryRecord,
+    IncomeStatementRecord,
     KnowledgeResult,
     NewsResult,
     ParseResultModel,
@@ -166,7 +168,7 @@ class TestParseResultModel:
         assert d["company_names"] == []
         assert d["time_period"] is None
         assert d["needs_news"] is False
-        assert d["knowledge_queries"] == []
+        assert d["knowledge_query"] is None
 
     def test_question_type_analysis(self):
         """question_type 'analysis' is accepted."""
@@ -198,7 +200,7 @@ class TestParseResultModel:
             "sector": None,
             "needs_news": True,
             "news_query": "Apple earnings",
-            "knowledge_queries": [],
+            "knowledge_query": None,
         }
         model = ParseResultModel(**llm_output)
         assert model.tickers == ["AAPL"]
@@ -218,7 +220,7 @@ class TestParseResultModel:
         model = ParseResultModel(**data)
         assert model.tickers == ["TSLA"]
         assert model.needs_news is False
-        assert model.knowledge_queries == []
+        assert model.knowledge_query is None
 
     def test_valid_time_periods_accepted(self):
         """All valid yfinance period strings are accepted."""
@@ -282,6 +284,51 @@ class TestParseResultModel:
         model = ParseResultModel(time_period="5d", time_start=None)
         assert model.time_period == "5d"
         assert model.time_start is None
+
+
+# ---------------------------------------------------------------------------
+# Fundamental Data Models
+# ---------------------------------------------------------------------------
+
+
+class TestFundamentalDataModels:
+    """Tests for FMP fundamental data Pydantic models."""
+
+    def test_income_statement_record(self):
+        record = IncomeStatementRecord(
+            date="2025-09-30", period="FY", revenue=394328000000
+        )
+        assert record.revenue == 394328000000
+        assert record.eps is None  # default
+
+    def test_fundamental_data_defaults(self):
+        data = FundamentalData(ticker="AAPL", name="Apple Inc.")
+        assert data.income_statements == []
+        assert data.transcript_summary == ""
+
+    def test_needs_fundamentals_default(self):
+        model = ParseResultModel()
+        assert model.needs_fundamentals is False
+        assert model.fundamental_endpoints == []
+
+    def test_valid_fundamental_endpoints(self):
+        model = ParseResultModel(
+            fundamental_endpoints=["financial_statement", "earnings_transcript"]
+        )
+        assert model.fundamental_endpoints == ["financial_statement", "earnings_transcript"]
+
+    def test_invalid_fundamental_endpoints_filtered(self):
+        model = ParseResultModel(
+            fundamental_endpoints=["financial_statement", "invalid_endpoint", "income_statement"]
+        )
+        # Only "financial_statement" is valid; "income_statement" is now invalid (old granular name)
+        assert model.fundamental_endpoints == ["financial_statement"]
+
+    def test_earnings_transcript_endpoint_accepted(self):
+        model = ParseResultModel(
+            fundamental_endpoints=["earnings_transcript"]
+        )
+        assert model.fundamental_endpoints == ["earnings_transcript"]
 
 
 # ---------------------------------------------------------------------------

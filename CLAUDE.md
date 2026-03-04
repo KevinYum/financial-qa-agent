@@ -6,7 +6,7 @@ A financial QA agent with a Python backend API and simple web frontend for demo 
 ## Tech Stack
 - **Backend**: Python, FastAPI, managed with `uv`
 - **Agent**: LangGraph (StateGraph), langchain-openai (ChatOpenAI — works with OpenAI and OpenRouter)
-- **Tools**: yfinance (market data), Brave Search API (news), ChromaDB (knowledge base)
+- **Tools**: yfinance (market data), FMP (fundamental data), Brave Search API (news), ChromaDB (knowledge base)
 - **Config**: pydantic-settings (reads `.env` automatically)
 - **Frontend**: Vanilla HTML/CSS/JS (simple web SDK, no framework)
 - **Package Manager**: `uv` (not pip, not poetry)
@@ -54,9 +54,10 @@ financial-qa-agent/
 │       ├── models.py      # Pydantic models for tools, parse result, trace events
 │       └── tools/
 │           ├── __init__.py
-│           ├── market_data.py    # yfinance OHLCV + fundamentals
-│           ├── news_search.py    # Brave Search API
-│           └── knowledge_base.py # ChromaDB local search + Brave web search
+│           ├── market_data.py        # yfinance OHLCV + fundamentals
+│           ├── fundamental_data.py   # FMP API: financial statements + earnings transcripts
+│           ├── news_search.py        # Brave Search API
+│           └── knowledge_base.py     # ChromaDB local search + Brave web search
 ├── tests/
 │   ├── conftest.py        # Shared test fixtures
 │   ├── test_api.py        # API endpoint tests

@@ -354,8 +354,8 @@ async def test_local_knowledge_no_results():
 
 
 @pytest.mark.asyncio
-async def test_local_knowledge_uses_knowledge_queries():
-    """Local knowledge uses knowledge_queries from parse result for ChromaDB search."""
+async def test_local_knowledge_uses_knowledge_query():
+    """Local knowledge uses knowledge_query from parse result for ChromaDB search."""
     import chromadb
 
     client = chromadb.Client()
@@ -380,10 +380,7 @@ async def test_local_knowledge_uses_knowledge_queries():
         result = await fetch_local_knowledge(
             "How do AAPL stock options work and should I exercise them?",
             parse_result={
-                "knowledge_queries": [
-                    "What are stock options?",
-                    "When should you exercise stock options?",
-                ],
+                "knowledge_query": "stock option right to buy or sell",
             },
         )
         assert "option" in result.lower()
@@ -516,3 +513,214 @@ async def test_web_knowledge_includes_reference_urls():
         # Verify markdown reference format
         assert "Reference:" in result
         assert "[ETF Basics Guide](https://example.com/etf-guide)" in result
+
+
+# ---------------------------------------------------------------------------
+# Fundamental Data Tool — fetch_fundamental_data
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fundamental_data_no_api_key():
+    """Missing FMP API key returns graceful message."""
+    with patch("src.financial_qa_agent.tools.fundamental_data.settings") as mock_s:
+        mock_s.fmp_api_key = ""
+        from src.financial_qa_agent.tools.fundamental_data import fetch_fundamental_data
+
+        result = await fetch_fundamental_data("Apple revenue")
+        assert "not configured" in result
+
+
+@pytest.mark.asyncio
+async def test_fundamental_data_no_tickers():
+    """No tickers in parse result returns appropriate message."""
+    with patch("src.financial_qa_agent.tools.fundamental_data.settings") as mock_s:
+        mock_s.fmp_api_key = "test-key"
+        from src.financial_qa_agent.tools.fundamental_data import fetch_fundamental_data
+
+        result = await fetch_fundamental_data("What is revenue?", parse_result={})
+        assert "No stock tickers" in result
+
+
+@pytest.mark.asyncio
+async def test_fundamental_data_non_equity_rejected():
+    """Non-equity asset types are gracefully rejected."""
+    with patch("src.financial_qa_agent.tools.fundamental_data.settings") as mock_s:
+        mock_s.fmp_api_key = "test-key"
+        from src.financial_qa_agent.tools.fundamental_data import fetch_fundamental_data
+
+        result = await fetch_fundamental_data(
+            "Bitcoin financials",
+            parse_result={"tickers": ["BTC-USD"], "asset_type": "crypto"},
+        )
+        assert "only available for equities" in result
+
+
+@pytest.mark.asyncio
+async def test_fundamental_data_commodity_ticker_filtered():
+    """Commodity tickers (GC=F) are filtered out even without asset_type."""
+    with patch("src.financial_qa_agent.tools.fundamental_data.settings") as mock_s:
+        mock_s.fmp_api_key = "test-key"
+        from src.financial_qa_agent.tools.fundamental_data import fetch_fundamental_data
+
+        result = await fetch_fundamental_data(
+            "Gold financials",
+            parse_result={"tickers": ["GC=F"]},
+        )
+        assert "only available for equities" in result
+
+
+@pytest.mark.asyncio
+async def test_fundamental_data_income_statement():
+    """Successful income statement fetch returns formatted data."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = [
+        {
+            "date": "2025-09-30",
+            "period": "FY",
+            "revenue": 394328000000,
+            "grossProfit": 170782000000,
+            "operatingIncome": 119437000000,
+            "netIncome": 96995000000,
+            "eps": 6.42,
+            "ebitda": 130541000000,
+        }
+    ]
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch("src.financial_qa_agent.tools.fundamental_data.settings") as mock_s,
+        patch(
+            "src.financial_qa_agent.tools.fundamental_data.httpx.AsyncClient",
+            return_value=mock_client,
+        ),
+    ):
+        mock_s.fmp_api_key = "test-key"
+        from src.financial_qa_agent.tools.fundamental_data import fetch_fundamental_data
+
+        result = await fetch_fundamental_data(
+            "Apple revenue",
+            parse_result={
+                "tickers": ["AAPL"],
+                "asset_type": "equity",
+                "fundamental_endpoints": ["financial_statement"],
+            },
+        )
+        assert "Revenue" in result
+        assert "$394.33B" in result
+        assert "EPS: $6.42" in result
+
+
+@pytest.mark.asyncio
+async def test_fundamental_data_selects_requested_endpoints():
+    """financial_statement makes exactly 1 FMP call (income statement)."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = [
+        {"date": "2025-09-30", "period": "FY", "revenue": 100000000}
+    ]
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch("src.financial_qa_agent.tools.fundamental_data.settings") as mock_s,
+        patch(
+            "src.financial_qa_agent.tools.fundamental_data.httpx.AsyncClient",
+            return_value=mock_client,
+        ),
+    ):
+        mock_s.fmp_api_key = "test-key"
+        from src.financial_qa_agent.tools.fundamental_data import fetch_fundamental_data
+
+        await fetch_fundamental_data(
+            "Apple revenue",
+            parse_result={
+                "tickers": ["AAPL"],
+                "fundamental_endpoints": ["financial_statement"],
+            },
+        )
+        # financial_statement → 1 FMP call (income statement only)
+        assert mock_client.get.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fundamental_data_no_endpoints_requested():
+    """When parser sets no endpoints, tool returns appropriate message."""
+    with patch("src.financial_qa_agent.tools.fundamental_data.settings") as mock_s:
+        mock_s.fmp_api_key = "test-key"
+        from src.financial_qa_agent.tools.fundamental_data import fetch_fundamental_data
+
+        result = await fetch_fundamental_data(
+            "Apple stock",
+            parse_result={
+                "tickers": ["AAPL"],
+                "fundamental_endpoints": [],
+            },
+        )
+        assert "No fundamental data endpoints requested" in result
+
+
+@pytest.mark.asyncio
+async def test_fundamental_data_earnings_transcript():
+    """Earnings transcript is fetched and summarized via LLM."""
+    # Mock the FMP API response for transcript
+    mock_response = MagicMock()
+    mock_response.json.return_value = [
+        {
+            "date": "2025-07-31",
+            "symbol": "AAPL",
+            "quarter": 3,
+            "year": 2025,
+            "content": "Tim Cook: We are pleased to report record revenue of $94.8 billion. "
+            "Our services business continues to grow. Looking ahead, we expect "
+            "continued strength in our product lineup.",
+        }
+    ]
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    # Mock the LLM for transcript summarization
+    mock_llm_response = MagicMock()
+    mock_llm_response.content = (
+        "**Financial Highlights**: Record revenue of $94.8B. "
+        "Services business growing. "
+        "**Guidance**: Continued strength expected."
+    )
+    mock_llm = AsyncMock()
+    mock_llm.ainvoke = AsyncMock(return_value=mock_llm_response)
+
+    with (
+        patch("src.financial_qa_agent.tools.fundamental_data.settings") as mock_s,
+        patch(
+            "src.financial_qa_agent.tools.fundamental_data.httpx.AsyncClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "src.financial_qa_agent.agent._build_llm",
+            return_value=mock_llm,
+        ),
+    ):
+        mock_s.fmp_api_key = "test-key"
+        from src.financial_qa_agent.tools.fundamental_data import fetch_fundamental_data
+
+        result = await fetch_fundamental_data(
+            "What did Tim Cook say in the latest earnings call?",
+            parse_result={
+                "tickers": ["AAPL"],
+                "fundamental_endpoints": ["earnings_transcript"],
+            },
+        )
+        assert "Earnings Call Transcript" in result
+        assert "94.8B" in result
