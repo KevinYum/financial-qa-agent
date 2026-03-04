@@ -8,9 +8,10 @@ for validation and serialization, not replacements.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +91,7 @@ class ParseResultModel(BaseModel):
     with .model_dump() for LangGraph state compatibility.
     """
 
+    question_type: str = "knowledge"  # "analysis" or "knowledge"
     tickers: list[str] = []
     company_names: list[str] = []
     time_period: str | None = None
@@ -100,6 +102,14 @@ class ParseResultModel(BaseModel):
     needs_news: bool = False
     news_query: str | None = None
     knowledge_queries: list[str] = []
+
+    @field_validator("question_type")
+    @classmethod
+    def validate_question_type(cls, v: str) -> str:
+        """Coerce invalid question_type values to 'knowledge' (safe default)."""
+        if v not in ("analysis", "knowledge"):
+            return "knowledge"
+        return v
 
     @field_validator("time_period")
     @classmethod
@@ -113,6 +123,34 @@ class ParseResultModel(BaseModel):
         if v is not None and v not in VALID_TIME_PERIODS:
             return None
         return v
+
+    @field_validator("time_start", "time_end")
+    @classmethod
+    def validate_date_format(cls, v: str | None) -> str | None:
+        """Validate that date strings are in YYYY-MM-DD format.
+
+        The LLM may return dates in other formats (e.g. "01/15/2026",
+        "January 15, 2026"). Only strict YYYY-MM-DD is accepted — invalid
+        formats are silently dropped to None so the downstream tool falls
+        back to period-based queries.
+        """
+        if v is None:
+            return None
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def clear_period_when_dates_set(self) -> "ParseResultModel":
+        """When time_start is set, force time_period to None.
+
+        Date-range queries (start/end) and period-based queries are mutually
+        exclusive in yfinance. If the LLM returns both, the date range takes
+        priority because it's more specific.
+        """
+        if self.time_start is not None and self.time_period is not None:
+            self.time_period = None
+        return self
 
 
 # ---------------------------------------------------------------------------

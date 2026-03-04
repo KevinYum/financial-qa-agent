@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     chroma_collection_name: str = "financial_knowledge"
 
     # Knowledge base tuning
-    kb_min_results: int = 2
+    kb_max_results: int = 3
     kb_max_distance: float = 0.5
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

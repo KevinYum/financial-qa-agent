@@ -56,7 +56,7 @@ financial-qa-agent/
 │           ├── __init__.py
 │           ├── market_data.py    # yfinance OHLCV + fundamentals
 │           ├── news_search.py    # Brave Search API
-│           └── knowledge_base.py # ChromaDB + Brave fallback
+│           └── knowledge_base.py # ChromaDB local search + Brave web search
 ├── tests/
 │   ├── conftest.py        # Shared test fixtures
 │   ├── test_api.py        # API endpoint tests

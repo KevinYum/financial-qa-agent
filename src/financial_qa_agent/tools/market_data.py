@@ -25,6 +25,9 @@ def _fetch_ticker_data(
     """Synchronous yfinance fetch for a single ticker.
 
     If start is provided, uses date range (start/end). Otherwise uses period.
+
+    All data points are passed to the LLM — the synthesize prompt instructs
+    it to select only question-relevant facts for the response.
     """
     t = yf.Ticker(ticker)
     info = t.info or {}
@@ -36,8 +39,7 @@ def _fetch_ticker_data(
 
     history_records: list[HistoryRecord] = []
     if not hist.empty:
-        # Show at most last 10 data points regardless of period
-        for date, row in hist.tail(10).iterrows():
+        for date, row in hist.iterrows():
             history_records.append(HistoryRecord(
                 date=str(date.date()),
                 open=round(row.get("Open", 0), 2),
@@ -76,7 +78,7 @@ def _format_ticker_data(data: dict) -> str:
     if data["sector"]:
         lines.append(f"Sector: {data['sector']} / {data.get('industry', 'N/A')}")
     if data["recent_history"]:
-        lines.append("Recent OHLCV:")
+        lines.append("OHLCV:")
         for h in data["recent_history"]:
             lines.append(
                 f"  {h['date']}: O={h['open']} H={h['high']} "

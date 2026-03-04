@@ -1,8 +1,12 @@
-"""Knowledge base tool — ChromaDB vector search with Brave web fallback.
+"""Knowledge base tool — ChromaDB local search and Brave web search.
+
+Two public functions:
+- ``fetch_local_knowledge`` — query ChromaDB only (semantic vector search)
+- ``fetch_web_knowledge``  — query Brave web API, store results in ChromaDB
 
 Embedding: ChromaDB's default embedding function (all-MiniLM-L6-v2 via
 onnxruntime, 384-dim). The model is bundled with chromadb — no extra
-download or API key required. Both `query` and `upsert` embed text
+download or API key required. Both ``query`` and ``upsert`` embed text
 automatically through this function.
 """
 
@@ -28,7 +32,7 @@ def _get_collection() -> chromadb.Collection:
     """Get or create the ChromaDB collection (lazy singleton).
 
     Uses ChromaDB's default embedding function (all-MiniLM-L6-v2, 384-dim)
-    so both `query(query_texts=...)` and `upsert(documents=...)` embed text
+    so both ``query(query_texts=...)`` and ``upsert(documents=...)`` embed text
     automatically — no explicit embedding call needed.
     """
     global _client, _collection
@@ -60,7 +64,7 @@ def _doc_id(text: str, source: str) -> str:
 
 
 async def _brave_web_search(query: str) -> list[dict]:
-    """Fallback: search Brave web API and return structured results."""
+    """Search Brave web API and return structured results."""
     if not settings.brave_api_key:
         return []
 
@@ -103,15 +107,21 @@ def _store_in_chromadb(collection: chromadb.Collection, results: list[dict]) -> 
     collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
 
 
-async def fetch_knowledge(question: str, parse_result: dict | None = None) -> str:
-    """Query the knowledge base. Falls back to web search if results are sparse.
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+async def fetch_local_knowledge(
+    question: str, parse_result: dict | None = None
+) -> str:
+    """Query the local ChromaDB knowledge base (no web fallback).
 
     Strategy:
-    1. Use knowledge_queries from parse result if available, otherwise raw question
-    2. Query ChromaDB for similar documents (semantic search)
-    3. Filter by distance threshold (cosine similarity)
-    4. If too few good results, search Brave and store for future use
-    5. Return combined results formatted for LLM consumption
+    1. Use knowledge_queries from parse result if available, else raw question
+    2. Query ChromaDB for similar documents (semantic search, cosine distance)
+    3. Filter by distance threshold
+    4. Return formatted results for LLM consumption
     """
     parse_result = parse_result or {}
     collection = _get_collection()
@@ -119,10 +129,13 @@ async def fetch_knowledge(question: str, parse_result: dict | None = None) -> st
     # Use parsed knowledge queries if available, otherwise raw question
     queries = parse_result.get("knowledge_queries") or [question]
     query_text = " ".join(queries) if len(queries) > 1 else queries[0]
-    logger.debug("Knowledge base query: %r (from %d sub-queries)",
-                 query_text[:100], len(queries))
+    logger.debug(
+        "Local knowledge query: %r (from %d sub-queries)",
+        query_text[:100],
+        len(queries),
+    )
 
-    results = collection.query(query_texts=[query_text], n_results=3)
+    results = collection.query(query_texts=[query_text], n_results=settings.kb_max_results)
 
     distances = results.get("distances", [[]])[0]
     documents = results.get("documents", [[]])[0]
@@ -139,22 +152,14 @@ async def fetch_knowledge(question: str, parse_result: dict | None = None) -> st
         if dist < settings.kb_max_distance
     ]
 
-    logger.debug("ChromaDB returned %d good results (threshold %.2f)",
-                 len(good_results), settings.kb_max_distance)
-
-    if len(good_results) < settings.kb_min_results:
-        # Fallback to Brave web search
-        fallback_query = parse_result.get("news_query") or query_text
-        logger.debug("Sparse results — falling back to Brave: %r", fallback_query)
-        web_results = await _brave_web_search(fallback_query)
-        if web_results:
-            logger.debug("Brave fallback returned %d results, storing in ChromaDB",
-                         len(web_results))
-            _store_in_chromadb(collection, web_results)
-            good_results.extend(web_results)
+    logger.debug(
+        "ChromaDB returned %d good results (threshold %.2f)",
+        len(good_results),
+        settings.kb_max_distance,
+    )
 
     if not good_results:
-        return "No relevant knowledge found for this question."
+        return "No relevant local knowledge found."
 
     parts: list[str] = []
     for i, r in enumerate(good_results, 1):
@@ -165,5 +170,47 @@ async def fetch_knowledge(question: str, parse_result: dict | None = None) -> st
             parts.append(f"[{i}] {r['text']}\n    Reference: {ref_label}")
         else:
             parts.append(f"[{i}] {r['text']}")
+
+    return "\n\n".join(parts)
+
+
+async def fetch_web_knowledge(
+    question: str, parse_result: dict | None = None
+) -> str:
+    """Search the web for knowledge and store results in ChromaDB.
+
+    Strategy:
+    1. Build search query from parse result (news_query or knowledge_queries)
+    2. Call Brave web search API
+    3. Store results in ChromaDB for future local retrieval
+    4. Return formatted results with source references
+    """
+    parse_result = parse_result or {}
+    collection = _get_collection()
+
+    # Build query from parse result
+    queries = parse_result.get("knowledge_queries") or [question]
+    query_text = " ".join(queries) if len(queries) > 1 else queries[0]
+    fallback_query = parse_result.get("news_query") or query_text
+
+    logger.debug("Web knowledge search: %r", fallback_query)
+    web_results = await _brave_web_search(fallback_query)
+
+    if not web_results:
+        return "No relevant web results found."
+
+    # Store in ChromaDB for future local queries
+    logger.debug(
+        "Web search returned %d results, storing in ChromaDB", len(web_results)
+    )
+    _store_in_chromadb(collection, web_results)
+
+    # Format with reference URLs
+    parts: list[str] = []
+    for i, r in enumerate(web_results, 1):
+        title = r.get("title", "")
+        source = r.get("source", "")
+        ref_label = f"[{title}]({source})" if (title and source) else source
+        parts.append(f"[{i}] {r['text']}\n    Reference: {ref_label}")
 
     return "\n\n".join(parts)

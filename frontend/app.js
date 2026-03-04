@@ -19,7 +19,14 @@ const tabPanes = document.querySelectorAll(".tab-pane");
 const TOOL_TAB_MAP = {
   market_data: "tab-market-data",
   news_search: "tab-news-search",
-  knowledge_base: "tab-knowledge-base",
+  local_knowledge: "tab-knowledge",
+  web_knowledge: "tab-knowledge",
+};
+
+// Sub-section labels within the merged Knowledge tab
+const TOOL_SECTION_LABEL = {
+  local_knowledge: "Local Knowledge",
+  web_knowledge: "Online Knowledge",
 };
 
 /* ---------------------------------------------------------------------------
@@ -78,7 +85,7 @@ function resetTrace() {
   document.getElementById("tab-agent-loop").innerHTML = "";
   document.getElementById("tab-market-data").innerHTML = "";
   document.getElementById("tab-news-search").innerHTML = "";
-  document.getElementById("tab-knowledge-base").innerHTML = "";
+  document.getElementById("tab-knowledge").innerHTML = "";
 }
 
 function escapeHtml(str) {
@@ -124,10 +131,31 @@ function appendAgentLoopEntry(data) {
 }
 
 /* Tool tabs — input / output blocks */
+
+/** Get or create a sub-section container for a tool inside its tab. */
+function getToolContainer(tabId, toolName) {
+  const label = TOOL_SECTION_LABEL[toolName];
+  if (!label) return document.getElementById(tabId);
+
+  // Check if a sub-section already exists for this tool
+  const existingId = `subsection-${toolName}`;
+  let subsection = document.getElementById(existingId);
+  if (subsection) return subsection;
+
+  // Create sub-section with header
+  const tab = document.getElementById(tabId);
+  subsection = document.createElement("div");
+  subsection.id = existingId;
+  subsection.className = "knowledge-subsection";
+  subsection.innerHTML = `<div class="subsection-header">${escapeHtml(label)}</div>`;
+  tab.appendChild(subsection);
+  return subsection;
+}
+
 function appendToolInput(data) {
   const tabId = TOOL_TAB_MAP[data.tool];
   if (!tabId) return;
-  const container = document.getElementById(tabId);
+  const container = getToolContainer(tabId, data.tool);
 
   const section = document.createElement("div");
   section.className = "tool-section";
@@ -140,7 +168,7 @@ function appendToolInput(data) {
 function appendToolOutput(data) {
   const tabId = TOOL_TAB_MAP[data.tool];
   if (!tabId) return;
-  const container = document.getElementById(tabId);
+  const container = getToolContainer(tabId, data.tool);
 
   const section = document.createElement("div");
   section.className = "tool-section";

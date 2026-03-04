@@ -1,10 +1,10 @@
 # Architecture Specification
 
-**Version**: 0.5.0
+**Version**: 0.6.0
 **Last Updated**: 2026-03-04
 
 ## Overview
-A financial QA agent with a LangGraph-orchestrated pipeline, two-type question routing (analysis vs. knowledge), three data-fetching tools, SSE-based trace streaming, and a vanilla web frontend with a two-panel layout (chat + trace).
+A financial QA agent with a LangGraph-orchestrated pipeline, two-type question routing (analysis vs. knowledge hub), data-fetching tools with LLM-gated knowledge fallback, SSE-based trace streaming, and a vanilla web frontend with a two-panel layout (chat + trace).
 
 ## Components
 
@@ -17,10 +17,12 @@ A financial QA agent with a LangGraph-orchestrated pipeline, two-type question r
 
 ### Agent (LangGraph)
 - **File**: `src/financial_qa_agent/agent.py`
-- **Orchestrator**: LangGraph `StateGraph` with 5 nodes
+- **Orchestrator**: LangGraph `StateGraph` with 7 nodes
 - **LLM**: `langchain-openai` `ChatOpenAI` — works with OpenAI and OpenRouter via `base_url`
-- **State**: `AgentState(TypedDict)` — question, parse_result, question_type, market_data, news_data, knowledge_data, answer
-- **Pipeline**: parse → two-type route (analysis: market_data [+ news] | knowledge: knowledge_base) → synthesize → return
+- **State**: `AgentState(TypedDict)` — question, parse_result, question_type, market_data, news_data, local_knowledge_data, web_knowledge_data, knowledge_sufficient, answer
+- **Pipeline**: parse → two-type route:
+  - Analysis: fetch_market_data [+ fetch_news] → synthesize → return
+  - Knowledge Hub: fetch_local_knowledge → evaluate_sufficiency → [fetch_web_knowledge if insufficient] → synthesize → return
 - **Question types**: analysis (tickers present → data summary + analysis) | knowledge (no tickers → answer + references)
 - **Tracing**: `contextvars.ContextVar`-based trace queue; nodes emit events via `_emit_trace()` / `_emit_trace_sync()`
 
@@ -37,7 +39,9 @@ A financial QA agent with a LangGraph-orchestrated pipeline, two-type question r
 ### Tools (`src/financial_qa_agent/tools/`)
 1. **market_data.py** — yfinance: OHLCV, fundamentals (tickers from parse node, no regex fallback). Constructs `TickerData` and `HistoryRecord` models, returns `.model_dump(by_alias=True)`.
 2. **news_search.py** — Brave Search API: recent financial news. Constructs `NewsResult` models for structured formatting.
-3. **knowledge_base.py** — ChromaDB vector search with Brave web fallback, auto-population, URL/title metadata retention. Constructs `KnowledgeResult` models for results.
+3. **knowledge_base.py** — Two public functions:
+   - `fetch_local_knowledge` — ChromaDB vector search only (semantic cosine distance, threshold filtering). Constructs `KnowledgeResult` models.
+   - `fetch_web_knowledge` — Brave web search, stores results in ChromaDB for future local retrieval (auto-population), URL/title metadata retention. Constructs `KnowledgeResult` models.
 
 All tools include DEBUG-level logging for backend observability.
 
@@ -46,7 +50,7 @@ All tools include DEBUG-level logging for backend observability.
 - **Purpose**: Demo UI with two-panel layout — chat (left) + trace (right)
 - **No build step** — plain HTML, CSS, and JS files
 - **Communicates with backend via SSE stream (`POST /api/ask/stream`)**
-- **Trace panel**: 4 tabs — Agent Loop, Market Data, News Search, Knowledge Base
+- **Trace panel**: 5 tabs — Agent Loop, Market Data, News Search, Local Knowledge, Web Knowledge
 - **Progressive updates**: SSE events update the trace panel in real-time during pipeline execution
 
 ## External Services
@@ -62,7 +66,9 @@ All tools include DEBUG-level logging for backend observability.
 User (browser) → app.js → POST /api/ask/stream → FastAPI → LangGraph agent:
   parse (LLM) → route by question type:
     Analysis (tickers): fetch_market_data [+ fetch_news] → synthesize (data + analysis)
-    Knowledge (no tickers): fetch_knowledge              → synthesize (answer + references)
+    Knowledge (no tickers): fetch_local_knowledge → evaluate_sufficiency (LLM)
+                              ├── sufficient → synthesize (answer + references)
+                              └── insufficient → fetch_web_knowledge → synthesize (answer + references)
   → SSE events → browser
 
   Trace events flow: agent nodes → asyncio.Queue → SSE generator → browser

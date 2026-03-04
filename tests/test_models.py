@@ -161,11 +161,30 @@ class TestParseResultModel:
         """All fields have sensible defaults."""
         model = ParseResultModel()
         d = model.model_dump()
+        assert d["question_type"] == "knowledge"
         assert d["tickers"] == []
         assert d["company_names"] == []
         assert d["time_period"] is None
         assert d["needs_news"] is False
         assert d["knowledge_queries"] == []
+
+    def test_question_type_analysis(self):
+        """question_type 'analysis' is accepted."""
+        model = ParseResultModel(question_type="analysis")
+        assert model.question_type == "analysis"
+
+    def test_question_type_knowledge(self):
+        """question_type 'knowledge' is accepted."""
+        model = ParseResultModel(question_type="knowledge")
+        assert model.question_type == "knowledge"
+
+    def test_invalid_question_type_coerced_to_knowledge(self):
+        """Invalid question_type values are coerced to 'knowledge' (safe default)."""
+        for invalid in ["data", "mixed", "news", "", "ANALYSIS"]:
+            model = ParseResultModel(question_type=invalid)
+            assert model.question_type == "knowledge", (
+                f"Expected 'knowledge' for {invalid!r}, got {model.question_type!r}"
+            )
 
     def test_validates_llm_output(self):
         """Typical LLM JSON output is validated correctly."""
@@ -219,6 +238,50 @@ class TestParseResultModel:
         """None time_period is preserved."""
         model = ParseResultModel(time_period=None)
         assert model.time_period is None
+
+    def test_valid_date_formats_accepted(self):
+        """YYYY-MM-DD date strings are accepted for time_start/time_end."""
+        model = ParseResultModel(time_start="2026-01-15", time_end="2026-01-16")
+        assert model.time_start == "2026-01-15"
+        assert model.time_end == "2026-01-16"
+
+    def test_invalid_date_formats_coerced_to_none(self):
+        """Non-YYYY-MM-DD date strings are coerced to None."""
+        invalid_dates = [
+            "01/15/2026",        # MM/DD/YYYY
+            "January 15, 2026",  # human readable
+            "2026/01/15",        # YYYY/MM/DD
+            "15-01-2026",        # DD-MM-YYYY
+            "1/15",              # M/DD (no year)
+            "2026-1-15",         # single-digit month
+            "not-a-date",
+        ]
+        for bad_date in invalid_dates:
+            model = ParseResultModel(time_start=bad_date)
+            assert model.time_start is None, f"Expected None for {bad_date!r}, got {model.time_start!r}"
+
+    def test_none_dates_stay_none(self):
+        """None time_start/time_end are preserved."""
+        model = ParseResultModel(time_start=None, time_end=None)
+        assert model.time_start is None
+        assert model.time_end is None
+
+    def test_time_period_cleared_when_dates_set(self):
+        """time_period is forced to None when time_start is set (date range takes priority)."""
+        model = ParseResultModel(
+            time_period="1d",
+            time_start="2026-01-15",
+            time_end="2026-01-16",
+        )
+        assert model.time_period is None
+        assert model.time_start == "2026-01-15"
+        assert model.time_end == "2026-01-16"
+
+    def test_time_period_preserved_without_dates(self):
+        """time_period is preserved when no time_start is set."""
+        model = ParseResultModel(time_period="5d", time_start=None)
+        assert model.time_period == "5d"
+        assert model.time_start is None
 
 
 # ---------------------------------------------------------------------------
