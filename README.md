@@ -296,14 +296,16 @@ financial-qa-agent/
   - web search: Brave API, free tier
 
 - 优化扩展
-  - 首先需要优化的是现在的agent loop。用langgraph或者其他类似的工具认为编排整个agent flow其实并不是一个好的选择。生产系统上应当使用基于ReAct Loop的Agent Harness。
+  - 首先需要优化的是session management。目前每一个user input都是作为一个独立的输入进入agent loop，但更合理的方式是做一个简单的session概念，把session内部的q&a内容放进或者embedding进context，作为回答输出的上下文一部分。
+
+  - 其次需要优化的是现在的agent loop。用langgraph或者其他类似的工具认为编排整个agent flow其实并不是一个好的选择。生产系统上应当使用基于ReAct Loop的Agent Harness。
     - 他的优点在于确定性高，编写的预期比较明确，解决简单固定的agent任务落地快容易调试。
     - 他的缺点是，迭代维护起来会很麻烦，需求一动要改workflow而且动一个节点上下游都可能受到影响。而且对于复杂模糊的任务，人工抽象workflow可能会有数不清的补丁要打才能达到不断演进的需求，输入的corner case之类的情况。
     - 更主要的问题是，在模型能力已经非常强的现在，agent workflow对应的planning或者reasoning的能力基模早已经具备，更好的选择是作为agent开发，只需要一个通过的ReAct loop，和一系列调试过有效的相关tooling和skilling，然后让模型自身通过loop来动态生成每一个user request的执行workflow。
   
-  - 第二需要优化的是数据源。现在的结构化数据和非结构化数据是直接从金融服务和搜索API中获取，但如果要严肃的做一个金融Q&A Agent，应该需要维护自己的数据仓库。
+  - 另外必须优化的是数据源。现在的结构化数据和非结构化数据是直接从金融服务和搜索API中获取，但如果要严肃的做一个金融Q&A Agent，应该需要维护自己的数据仓库。
     - 原因一，对于Market Data，有直接的性能，成本，稳定性的考虑。
     - 原因二，对于news这类非结构化数据，直接通过search API能获得的质量是非常差的，需要大量的甄别清洗，提炼出高质量的数据，标注metadata，后续的分析才能有实际的交易价值。
     - 原因三，knowledge hub的构建，也需要大量的爬取来构造知识库，否则能retrieve到的甚至不如基座模型自带的语料。也因此，本项目的vec db只是为了演示流程和concept。
 
-  - 第三需要优化的Agent Loop对于不同输入有可能产生的异常和对应的处理，做这件事需要通过大量的内部test case构造，以及在上线后定期地根据线上数据改进tooling & prompts，甚至对于基座模型做RL（根据我的了解，除了coding agent还比较少有做到这一步的）。
+  - 再次需要优化的Agent Loop对于不同输入有可能产生的异常和对应的处理，做这件事需要通过大量的内部test case构造，以及在上线后定期地根据线上数据改进tooling & prompts，甚至对于基座模型做RL（根据我的了解，除了coding agent还比较少有做到这一步的）。
