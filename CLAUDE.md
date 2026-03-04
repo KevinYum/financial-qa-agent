@@ -5,6 +5,9 @@ A financial QA agent with a Python backend API and simple web frontend for demo 
 
 ## Tech Stack
 - **Backend**: Python, FastAPI, managed with `uv`
+- **Agent**: LangGraph (StateGraph), langchain-openai (ChatOpenAI — works with OpenAI and OpenRouter)
+- **Tools**: yfinance (market data), Brave Search API (news), ChromaDB (knowledge base)
+- **Config**: pydantic-settings (reads `.env` automatically)
 - **Frontend**: Vanilla HTML/CSS/JS (simple web SDK, no framework)
 - **Package Manager**: `uv` (not pip, not poetry)
 
@@ -20,11 +23,11 @@ A financial QA agent with a Python backend API and simple web frontend for demo 
 - When making changes, update related spec files in `specs/`, this `CLAUDE.md`, and `README.md`.
 - Specs must reflect the current state of the system, not a past or future state.
 - If a new feature is added, create or update the corresponding spec.
-- `README.md` contains 3 Mermaid architecture diagrams that must stay in sync:
-  1. **System Architecture** — components, data flow, interaction pattern
-  2. **Agent Loop** — question processing pipeline
-  3. **Project Structure** — folder layout and file responsibilities
-- When adding files, endpoints, middleware, or changing the agent pipeline, update the relevant diagram(s).
+- `README.md` contains architecture visuals that must stay in sync:
+  1. **System Architecture** (Mermaid) — components, data flow, interaction pattern
+  2. **Agent Loop** (text diagram) — question processing pipeline
+  3. **Project Structure** (text tree) — folder layout and file responsibilities
+- When adding files, endpoints, middleware, or changing the agent pipeline, update the relevant section(s).
 
 ### 3. Instruction Tracking
 - All user instructions are logged in `docs/instructions.md` with timestamps and version numbers.
@@ -41,20 +44,33 @@ financial-qa-agent/
 ├── README.md              # Project docs with architecture diagrams
 ├── CLAUDE.md              # This file - project rules
 ├── pyproject.toml         # Python project config (uv)
+├── .env.example           # Template for environment variables
 ├── src/
 │   └── financial_qa_agent/
 │       ├── __init__.py
+│       ├── config.py      # Settings (pydantic-settings, reads .env)
 │       ├── main.py        # FastAPI app entry point
-│       └── agent.py       # QA agent logic
+│       ├── agent.py       # LangGraph agent pipeline
+│       └── tools/
+│           ├── __init__.py
+│           ├── market_data.py    # yfinance OHLCV + fundamentals
+│           ├── news_search.py    # Brave Search API
+│           └── knowledge_base.py # ChromaDB + Brave fallback
 ├── tests/
-│   └── test_api.py        # API tests
+│   ├── conftest.py        # Shared test fixtures
+│   ├── test_api.py        # API endpoint tests
+│   ├── test_agent.py      # LangGraph pipeline tests
+│   └── test_tools.py      # Tool unit tests
 ├── frontend/
 │   ├── index.html         # Demo web page
 │   ├── style.css
 │   └── app.js
 ├── specs/
 │   ├── api.md             # API specification
-│   └── architecture.md    # Architecture overview
+│   ├── architecture.md    # Architecture overview
+│   └── agent.md           # Agent loop specification
+├── data/
+│   └── chroma/            # ChromaDB persistence (gitignored)
 └── docs/
     └── instructions.md    # Instruction log with timestamps
 ```

@@ -8,6 +8,10 @@ A financial question-answering agent with a Python/FastAPI backend and a vanilla
 # Install dependencies
 uv sync
 
+# Copy and fill in environment variables
+cp .env.example .env
+# Edit .env with your API keys (LLM_API_KEY, BRAVE_API_KEY)
+
 # Start the server (backend + frontend)
 uv run uvicorn src.financial_qa_agent.main:app --reload --port 8000
 
@@ -28,7 +32,6 @@ uv run pytest -v
 flowchart TB
     subgraph Browser["Browser (localhost:8000)"]
         UI["index.html\nChat UI"]
-        CSS["style.css"]
         JS["app.js\nFetch Client"]
     end
 
@@ -47,153 +50,144 @@ flowchart TB
         end
 
         subgraph Models["Pydantic Models"]
-            REQ["AskRequest\n{question: str}"]
+            REQ["AskRequest\n{question}"]
             RES["APIResponse\n{status, data, message}"]
         end
 
-        subgraph Core["Agent Core"]
-            AGENT["FinancialQAAgent\nagent.py"]
+        subgraph AgentCore["LangGraph Agent (agent.py)"]
+            PARSE["parse\n(LLM)"]
+            FETCH_MD["fetch_market_data\n(yfinance)"]
+            FETCH_NEWS["fetch_news\n(Brave API)"]
+            FETCH_KB["fetch_knowledge\n(ChromaDB)"]
+            SYNTH["synthesize\n(LLM)"]
         end
+    end
+
+    subgraph External["External Services"]
+        LLM_API["LLM API\n(OpenAI / OpenRouter)"]
+        BRAVE["Brave Search API"]
+        YAHOO["Yahoo Finance"]
+    end
+
+    subgraph Local["Local Storage"]
+        CHROMA["ChromaDB\n(data/chroma/)"]
     end
 
     %% User interaction
     USER((User)) -- "types question" --> UI
     UI --> JS
-    JS -- "POST /api/ask\n{question: ...}" --> UV
+    JS -- "POST /api/ask" --> UV
 
     %% Request flow
-    UV --> CORS --> STATIC
-    STATIC -- "/*.html,css,js" --> Browser
-    CORS --> ASK
-    UV --> HEALTH
+    UV --> CORS --> ASK
+    STATIC -- "static files" --> Browser
 
-    %% Processing flow
+    %% Agent flow
     ASK -- "validate" --> REQ
-    REQ --> AGENT
-    AGENT -- "answer" --> RES
-    RES -- "JSON response" --> JS
-    JS -- "render answer" --> UI
+    REQ --> PARSE
+    PARSE --> FETCH_MD & FETCH_NEWS & FETCH_KB
+    FETCH_MD & FETCH_NEWS & FETCH_KB --> SYNTH
+    SYNTH --> RES
+    RES -- "JSON" --> JS
+    JS -- "render" --> UI
+
+    %% External connections
+    PARSE & SYNTH -. "LLM calls" .-> LLM_API
+    FETCH_MD -. "OHLCV + info" .-> YAHOO
+    FETCH_NEWS -. "web search" .-> BRAVE
+    FETCH_KB -. "vector search" .-> CHROMA
+    FETCH_KB -. "fallback search" .-> BRAVE
 
     style Browser fill:#e8f4fd,stroke:#0066ff
     style Backend fill:#f0f0f0,stroke:#333
     style Middleware fill:#fff3cd,stroke:#856404
     style Routes fill:#d4edda,stroke:#155724
     style Models fill:#f8d7da,stroke:#721c24
-    style Core fill:#cce5ff,stroke:#004085
+    style AgentCore fill:#cce5ff,stroke:#004085
+    style External fill:#f5e6ff,stroke:#6f42c1
+    style Local fill:#e2e3e5,stroke:#495057
 ```
 
-**Interaction Pattern**: The frontend is a single-page chat UI that sends `POST /api/ask` requests via `fetch()`. The backend validates the input through Pydantic, delegates to the agent, and returns a JSON envelope `{status, data, message}`. The same uvicorn process serves both the API and the static frontend files.
+**Interaction Pattern**: The frontend sends `POST /api/ask` via `fetch()`. FastAPI validates through Pydantic, then delegates to the LangGraph agent. The agent parses the question into structured entities (tickers, time period, news flag, knowledge queries), routes to one or more fetch tools based on what was extracted, and synthesizes a final answer via an LLM call. The response returns as a JSON envelope `{status, data, message}`.
 
 ---
 
 ### 2. Agent Loop — Question Processing Pipeline
 
-```mermaid
-flowchart TD
-    START((User submits\nquestion)) --> VALIDATE
-
-    subgraph FastAPI["FastAPI Route Handler"]
-        VALIDATE{"Pydantic\nValidation"}
-        VALIDATE -- "invalid\n(missing field)" --> ERR422["422 Validation Error"]
-    end
-
-    VALIDATE -- "valid\nAskRequest" --> AGENT_ENTRY
-
-    subgraph AgentLoop["Agent Processing Loop (agent.py)"]
-        AGENT_ENTRY["agent.ask(question)"]
-        EMPTY_CHECK{"Empty or\nwhitespace?"}
-        AGENT_ENTRY --> EMPTY_CHECK
-
-        EMPTY_CHECK -- "yes" --> RAISE["raise ValueError"]
-
-        EMPTY_CHECK -- "no" --> PROCESS
-
-        subgraph PROCESS["Processing Pipeline (TBD)"]
-            direction TB
-            STEP1["1. Parse & Classify\nthe question"]
-            STEP2["2. Retrieve Context\n(knowledge / tools)"]
-            STEP3["3. Generate Answer\n(LLM / rule engine)"]
-            STEP4["4. Format Response"]
-            STEP1 --> STEP2 --> STEP3 --> STEP4
-        end
-
-        PROCESS --> ANSWER["Return answer string"]
-    end
-
-    RAISE --> CATCH_VAL
-    ANSWER --> BUILD_OK
-
-    subgraph ResponseBuilder["Response Builder"]
-        BUILD_OK["APIResponse\nstatus=ok\ndata={question, answer}"]
-        CATCH_VAL["APIResponse\nstatus=error\nmessage=ValueError text"]
-        CATCH_EXC["APIResponse\nstatus=error\nmessage=Internal server error"]
-    end
-
-    BUILD_OK --> JSON_OUT
-    CATCH_VAL --> JSON_OUT
-    CATCH_EXC --> JSON_OUT
-
-    JSON_OUT(("JSON to\nbrowser"))
-
-    style FastAPI fill:#d4edda,stroke:#155724
-    style AgentLoop fill:#cce5ff,stroke:#004085
-    style PROCESS fill:#fff3cd,stroke:#856404,stroke-dasharray: 5 5
-    style ResponseBuilder fill:#f8d7da,stroke:#721c24
+```
+User Question
+     │
+     ▼
+┌─────────────┐
+│    parse     │  ← LLM call: extract tickers, time period, news flag, knowledge queries
+└──────┬──────┘
+       │  (route by parse result — no classification label)
+       │
+       ├── tickers found?        ──► fetch_market_data   (yfinance OHLCV + fundamentals)
+       ├── needs_news = true?    ──► fetch_news          (Brave Search API)
+       ├── knowledge_queries?    ──► fetch_knowledge     (ChromaDB lookup → if sparse, Brave search → save to ChromaDB)
+       └── nothing extracted?    ──► fetch_knowledge     (fallback)
+       │
+       │  (multiple tools fire in parallel when multiple fields are populated)
+       ▼
+┌─────────────┐
+│ synthesize   │  ← LLM call with parse result + ALL fetched context + original question → final answer
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│  response    │  ← Structure into API envelope {status, data, message}
+└─────────────┘
 ```
 
-> **Note**: The inner "Processing Pipeline" steps (parse, retrieve, generate, format) are placeholders. The agent currently returns a stub response. The actual behavior — LLM integration, tool use, retrieval strategy — will be defined in a future iteration.
+**Routing is data-driven**: tool selection depends on which parse result fields are populated, not a classification label. Multiple tools can fire in parallel.
 
 ---
 
-### 3. Project Structure — Files & Responsibilities
+### 3. Project Structure
 
-```mermaid
-flowchart LR
-    subgraph Root["financial-qa-agent/"]
-        README["README.md\nProject documentation\n& architecture diagrams"]
-        CLAUDE["CLAUDE.md\nDevelopment rules\nfor Claude"]
-        PYPROJECT["pyproject.toml\nuv config, deps,\npytest settings"]
-        GITIGNORE[".gitignore"]
-    end
-
-    subgraph SrcPkg["src/financial_qa_agent/"]
-        INIT["__init__.py\nPackage marker"]
-        MAIN["main.py\nFastAPI app\nRoutes, models,\nstatic mount"]
-        AGENTPY["agent.py\nFinancialQAAgent\nQuestion processing"]
-    end
-
-    subgraph FrontDir["frontend/"]
-        HTML["index.html\nChat UI shell"]
-        CSSF["style.css\nLayout & theme"]
-        APPJS["app.js\nfetch() client\nDOM rendering"]
-    end
-
-    subgraph TestDir["tests/"]
-        TINIT["__init__.py"]
-        TAPI["test_api.py\n4 tests: health,\nask, empty, missing"]
-    end
-
-    subgraph SpecDir["specs/"]
-        APISPEC["api.md\nEndpoint contracts\n& response format"]
-        ARCHSPEC["architecture.md\nComponent overview\n& data flow"]
-    end
-
-    subgraph DocDir["docs/"]
-        INSTRLOG["instructions.md\nTimestamped log of\nevery user instruction"]
-    end
-
-    %% Relationships
-    MAIN -- "imports" --> AGENTPY
-    MAIN -- "serves" --> FrontDir
-    APPJS -- "calls" --> MAIN
-    TAPI -- "tests" --> MAIN
-
-    style Root fill:#f5f5f5,stroke:#333
-    style SrcPkg fill:#cce5ff,stroke:#004085
-    style FrontDir fill:#e8f4fd,stroke:#0066ff
-    style TestDir fill:#d4edda,stroke:#155724
-    style SpecDir fill:#fff3cd,stroke:#856404
-    style DocDir fill:#f8d7da,stroke:#721c24
+```
+financial-qa-agent/
+├── README.md                       --- Project documentation with architecture diagrams
+├── CLAUDE.md                       --- Development rules and conventions for Claude
+├── pyproject.toml                  --- uv project config, dependencies, pytest settings
+├── uv.lock                         --- Locked dependency versions
+├── .env.example                    --- Template for required environment variables
+├── .gitignore                      --- Git ignore rules
+│
+├── src/financial_qa_agent/         --- Backend Python package
+│   ├── __init__.py                 --- Package marker
+│   ├── config.py                   --- Settings via pydantic-settings (LLM, Brave, ChromaDB)
+│   ├── main.py                     --- FastAPI app: routes, Pydantic models, static mount
+│   ├── agent.py                    --- LangGraph agent: parse → fetch → synthesize pipeline
+│   └── tools/                      --- Data fetching tool modules
+│       ├── __init__.py             --- Tool exports
+│       ├── market_data.py          --- yfinance: OHLCV, fundamentals, ticker extraction
+│       ├── news_search.py          --- Brave Search API: recent financial news
+│       └── knowledge_base.py       --- ChromaDB vector search + Brave web fallback
+│
+├── frontend/                       --- Vanilla web UI (no build step)
+│   ├── index.html                  --- Chat interface shell
+│   ├── style.css                   --- Layout and theme
+│   └── app.js                      --- fetch() client, DOM rendering
+│
+├── tests/                          --- Test suite (all externals mocked)
+│   ├── __init__.py
+│   ├── conftest.py                 --- Shared fixtures (mock LLM responses)
+│   ├── test_api.py                 --- API endpoint tests (4 tests)
+│   ├── test_agent.py               --- LangGraph pipeline integration tests (15 tests)
+│   └── test_tools.py               --- Tool unit tests (21 tests)
+│
+├── specs/                          --- Living specifications
+│   ├── api.md                      --- Endpoint contracts and response format
+│   ├── architecture.md             --- Component overview and data flow
+│   └── agent.md                    --- Agent loop design, state schema, tool interfaces
+│
+├── data/                           --- Runtime data (gitignored)
+│   └── chroma/                     --- ChromaDB persistent vector storage
+│
+└── docs/                           --- Project history
+    └── instructions.md             --- Timestamped log of every user instruction
 ```
 
 ---
@@ -244,6 +238,11 @@ All responses follow the envelope: `{ status, data, message }`
 ## Tech Stack
 
 - **Backend**: Python 3.13+, FastAPI, uvicorn
+- **Agent Orchestration**: [LangGraph](https://langchain-ai.github.io/langgraph/) (StateGraph)
+- **LLM Provider**: [langchain-openai](https://python.langchain.com/docs/integrations/chat/openai/) (OpenAI / OpenRouter)
+- **Market Data**: [yfinance](https://github.com/ranaroussi/yfinance) (OHLCV, fundamentals)
+- **News Search**: [Brave Search API](https://brave.com/search/api/)
+- **Knowledge Base**: [ChromaDB](https://www.trychroma.com/) (local vector DB with web fallback)
 - **Frontend**: Vanilla HTML / CSS / JS (no build step)
 - **Package Manager**: [uv](https://docs.astral.sh/uv/)
 - **Testing**: pytest, pytest-asyncio, httpx

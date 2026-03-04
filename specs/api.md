@@ -1,6 +1,6 @@
 # API Specification
 
-**Version**: 0.1.0
+**Version**: 0.2.0
 **Last Updated**: 2026-03-04
 
 ## Base URL
@@ -9,7 +9,8 @@
 ## Endpoints
 
 ### POST /api/ask
-Receive a financial question and return an answer from the QA agent.
+Receive a financial question and return an answer from the LangGraph-powered QA agent.
+The agent classifies the question, fetches data from relevant tools (market data, news, knowledge base), and synthesizes a final answer via an LLM call.
 
 **Request Body**:
 ```json
