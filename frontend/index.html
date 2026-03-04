@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Financial QA Agent</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Financial QA Agent</h1>
+        <p class="subtitle">Ask any financial question</p>
+
+        <div class="chat-box" id="chatBox"></div>
+
+        <form id="askForm" class="input-area">
+            <input
+                type="text"
+                id="questionInput"
+                placeholder="Type your financial question..."
+                autocomplete="off"
+                required
+            />
+            <button type="submit" id="submitBtn">Ask</button>
+        </form>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
