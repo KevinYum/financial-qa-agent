@@ -5,24 +5,56 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Financial QA Agent</title>
     <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
 </head>
 <body>
-    <div class="container">
-        <h1>Financial QA Agent</h1>
-        <p class="subtitle">Ask any financial question</p>
+    <div class="app-container">
+        <header>
+            <h1>Financial QA Agent</h1>
+            <p class="subtitle">Ask any financial question</p>
+        </header>
 
-        <div class="chat-box" id="chatBox"></div>
+        <div class="main-panels">
+            <!-- Chat Panel -->
+            <div class="chat-panel">
+                <div class="chat-box" id="chatBox"></div>
+                <form id="askForm" class="input-area">
+                    <input
+                        type="text"
+                        id="questionInput"
+                        placeholder="Type your financial question..."
+                        autocomplete="off"
+                        required
+                    />
+                    <button type="submit" id="submitBtn">Ask</button>
+                </form>
+            </div>
 
-        <form id="askForm" class="input-area">
-            <input
-                type="text"
-                id="questionInput"
-                placeholder="Type your financial question..."
-                autocomplete="off"
-                required
-            />
-            <button type="submit" id="submitBtn">Ask</button>
-        </form>
+            <!-- Trace Panel -->
+            <div class="trace-panel">
+                <div class="trace-tabs">
+                    <button class="trace-tab active" data-tab="agent-loop" type="button">Agent Loop</button>
+                    <button class="trace-tab" data-tab="market-data" type="button">Market Data</button>
+                    <button class="trace-tab" data-tab="news-search" type="button">News Search</button>
+                    <button class="trace-tab" data-tab="knowledge-base" type="button">Knowledge Base</button>
+                </div>
+                <div class="trace-content">
+                    <div class="tab-pane active" id="tab-agent-loop">
+                        <p class="trace-placeholder">Submit a question to see the agent pipeline trace.</p>
+                    </div>
+                    <div class="tab-pane" id="tab-market-data">
+                        <p class="trace-placeholder">Market data tool input &amp; output will appear here.</p>
+                    </div>
+                    <div class="tab-pane" id="tab-news-search">
+                        <p class="trace-placeholder">News search tool input &amp; output will appear here.</p>
+                    </div>
+                    <div class="tab-pane" id="tab-knowledge-base">
+                        <p class="trace-placeholder">Knowledge base tool input &amp; output will appear here.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="app.js"></script>

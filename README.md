@@ -31,8 +31,8 @@ uv run pytest -v
 ```mermaid
 flowchart TB
     subgraph Browser["Browser (localhost:8000)"]
-        UI["index.html\nChat UI"]
-        JS["app.js\nFetch Client"]
+        UI["index.html\nChat + Trace UI"]
+        JS["app.js\nSSE Client"]
     end
 
     subgraph Backend["FastAPI Backend (Python)"]
@@ -47,6 +47,7 @@ flowchart TB
         subgraph Routes["API Routes"]
             HEALTH["GET /health"]
             ASK["POST /api/ask"]
+            STREAM["POST /api/ask/stream\n(SSE)"]
         end
 
         subgraph Models["Pydantic Models"]
@@ -55,6 +56,7 @@ flowchart TB
         end
 
         subgraph AgentCore["LangGraph Agent (agent.py)"]
+            TRACE["Trace Queue\n(contextvars)"]
             PARSE["parse\n(LLM)"]
             FETCH_MD["fetch_market_data\n(yfinance)"]
             FETCH_NEWS["fetch_news\n(Brave API)"]
@@ -76,20 +78,20 @@ flowchart TB
     %% User interaction
     USER((User)) -- "types question" --> UI
     UI --> JS
-    JS -- "POST /api/ask" --> UV
+    JS -- "POST /api/ask/stream" --> UV
 
     %% Request flow
-    UV --> CORS --> ASK
+    UV --> CORS --> STREAM
     STATIC -- "static files" --> Browser
 
     %% Agent flow
-    ASK -- "validate" --> REQ
+    STREAM -- "validate" --> REQ
     REQ --> PARSE
     PARSE --> FETCH_MD & FETCH_NEWS & FETCH_KB
     FETCH_MD & FETCH_NEWS & FETCH_KB --> SYNTH
-    SYNTH --> RES
-    RES -- "JSON" --> JS
-    JS -- "render" --> UI
+    PARSE & FETCH_MD & FETCH_NEWS & FETCH_KB & SYNTH -. "trace events" .-> TRACE
+    TRACE -. "SSE stream" .-> JS
+    JS -- "render chat + trace" --> UI
 
     %% External connections
     PARSE & SYNTH -. "LLM calls" .-> LLM_API
@@ -108,7 +110,7 @@ flowchart TB
     style Local fill:#e2e3e5,stroke:#495057
 ```
 
-**Interaction Pattern**: The frontend sends `POST /api/ask` via `fetch()`. FastAPI validates through Pydantic, then delegates to the LangGraph agent. The agent parses the question into structured entities (tickers, time period, news flag, knowledge queries), routes to one or more fetch tools based on what was extracted, and synthesizes a final answer via an LLM call. The response returns as a JSON envelope `{status, data, message}`.
+**Interaction Pattern**: The frontend sends `POST /api/ask/stream` via `fetch()`. FastAPI validates through Pydantic, then launches the LangGraph agent with a trace queue. The agent parses the question into structured entities (tickers, time period, news flag, knowledge queries), then routes based on question type: **analysis** (tickers found → market data + optional news → sectioned answer: Fact + Analysis + References) or **knowledge** (no tickers → knowledge base → sectioned answer: Answer + References). The LLM produces markdown with `##` section headers; the frontend renders it via `marked.js` (sanitized with DOMPurify) so headers, links, lists, bold text, tables, and code all display correctly. Each pipeline stage emits trace events to an `asyncio.Queue`, which the SSE generator streams to the browser in real-time. The frontend renders trace events in a 4-tab trace panel (Agent Loop, Market Data, News Search, Knowledge Base) and the final markdown answer in the chat panel. A batch endpoint (`POST /api/ask`) is also available for backward compatibility.
 
 ---
 
@@ -121,26 +123,28 @@ User Question
 ┌─────────────┐
 │    parse     │  ← LLM call: extract tickers, time period, news flag, knowledge queries
 └──────┬──────┘
-       │  (route by parse result — no classification label)
+       │  (route by question type — determined by tickers)
        │
-       ├── tickers found?        ──► fetch_market_data   (yfinance OHLCV + fundamentals)
-       ├── needs_news = true?    ──► fetch_news          (Brave Search API)
-       ├── knowledge_queries?    ──► fetch_knowledge     (ChromaDB lookup → if sparse, Brave search → save to ChromaDB)
-       └── nothing extracted?    ──► fetch_knowledge     (fallback)
-       │
-       │  (multiple tools fire in parallel when multiple fields are populated)
-       ▼
+       ├── tickers found? ─── TYPE A: ANALYSIS ────────────────────────────────────────┐
+       │   └── fetch_market_data   (yfinance OHLCV + fundamentals)                     │
+       │   └── [+ fetch_news]      (Brave Search API, if needs_news)                   │
+       │                                                                                │
+       ├── no tickers? ──── TYPE B: KNOWLEDGE ─────────────────────────────────────┐   │
+       │   └── fetch_knowledge     (ChromaDB lookup → if sparse, Brave → save)     │   │
+       │                                                                            │   │
+       ▼                                                                            ▼   ▼
+┌─────────────┐                                                              ┌─────────────┐
+│ synthesize   │  ← Knowledge prompt (## Answer + ## References)             │ synthesize   │
+│ (knowledge)  │                                                             │ (analysis)   │
+└──────┬──────┘                                                              └──────┬──────┘
+       │       ← Analysis prompt (## Fact + ## Analysis + ## References)            │
+       ▼                                                                            ▼
 ┌─────────────┐
-│ synthesize   │  ← LLM call with parse result + ALL fetched context + original question → final answer
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  response    │  ← Structure into API envelope {status, data, message}
+│  response    │  ← Frontend parses ## sections, renders clickable links
 └─────────────┘
 ```
 
-**Routing is data-driven**: tool selection depends on which parse result fields are populated, not a classification label. Multiple tools can fire in parallel.
+**Two question types**: The presence of tickers in the parse result determines the question type. **Analysis** questions (tickers found) fetch market data and optionally news, producing a sectioned answer: **Fact** (structured data) + **Analysis** (interpretation) + **References** (news links, if available). **Knowledge** questions (no tickers) query the knowledge base, producing a sectioned answer: **Answer** (explanation) + **References** (source links). The LLM outputs markdown; the frontend renders it natively via `marked.js` with DOMPurify sanitization.
 
 ---
 
@@ -160,23 +164,25 @@ financial-qa-agent/
 │   ├── config.py                   --- Settings via pydantic-settings (LLM, Brave, ChromaDB)
 │   ├── main.py                     --- FastAPI app: routes, Pydantic models, static mount
 │   ├── agent.py                    --- LangGraph agent: parse → fetch → synthesize pipeline
+│   ├── models.py                   --- Pydantic models: TickerData, NewsResult, trace events, etc.
 │   └── tools/                      --- Data fetching tool modules
 │       ├── __init__.py             --- Tool exports
-│       ├── market_data.py          --- yfinance: OHLCV, fundamentals, ticker extraction
+│       ├── market_data.py          --- yfinance: OHLCV, fundamentals (tickers from parse node)
 │       ├── news_search.py          --- Brave Search API: recent financial news
 │       └── knowledge_base.py       --- ChromaDB vector search + Brave web fallback
 │
 ├── frontend/                       --- Vanilla web UI (no build step)
-│   ├── index.html                  --- Chat interface shell
-│   ├── style.css                   --- Layout and theme
-│   └── app.js                      --- fetch() client, DOM rendering
+│   ├── index.html                  --- Two-panel layout + marked.js/DOMPurify CDN
+│   ├── style.css                   --- Grid layout, markdown styles, trace entries
+│   └── app.js                      --- SSE streaming, markdown rendering, trace panel
 │
 ├── tests/                          --- Test suite (all externals mocked)
 │   ├── __init__.py
 │   ├── conftest.py                 --- Shared fixtures (mock LLM responses)
-│   ├── test_api.py                 --- API endpoint tests (4 tests)
-│   ├── test_agent.py               --- LangGraph pipeline integration tests (15 tests)
-│   └── test_tools.py               --- Tool unit tests (21 tests)
+│   ├── test_api.py                 --- API endpoint + SSE stream tests (7 tests)
+│   ├── test_agent.py               --- LangGraph pipeline + routing + trace tests (21 tests)
+│   ├── test_models.py              --- Pydantic model unit tests (23 tests)
+│   └── test_tools.py               --- Tool unit tests (16 tests)
 │
 ├── specs/                          --- Living specifications
 │   ├── api.md                      --- Endpoint contracts and response format
@@ -194,17 +200,18 @@ financial-qa-agent/
 
 ## API Reference
 
-| Method | Endpoint     | Description                  |
-|--------|-------------|------------------------------|
-| POST   | `/api/ask`  | Submit a financial question  |
-| GET    | `/health`   | Health check                 |
+| Method | Endpoint            | Description                          |
+|--------|---------------------|--------------------------------------|
+| POST   | `/api/ask`          | Submit a financial question (batch)  |
+| POST   | `/api/ask/stream`   | Submit with SSE trace streaming      |
+| GET    | `/health`           | Health check                         |
 
-**Request** (`POST /api/ask`):
+**Request** (`POST /api/ask` or `POST /api/ask/stream`):
 ```json
 { "question": "What is compound interest?" }
 ```
 
-**Response**:
+**Batch Response** (`/api/ask`):
 ```json
 {
   "status": "ok",
@@ -216,7 +223,7 @@ financial-qa-agent/
 }
 ```
 
-All responses follow the envelope: `{ status, data, message }`
+**SSE Stream** (`/api/ask/stream`): Returns `text/event-stream` with events: `trace`, `tool_input`, `tool_output`, `answer`, `error`, `done`. See [`specs/api.md`](specs/api.md) for full SSE event reference.
 
 ---
 

@@ -51,6 +51,7 @@ financial-qa-agent/
 │       ├── config.py      # Settings (pydantic-settings, reads .env)
 │       ├── main.py        # FastAPI app entry point
 │       ├── agent.py       # LangGraph agent pipeline
+│       ├── models.py      # Pydantic models for tools, parse result, trace events
 │       └── tools/
 │           ├── __init__.py
 │           ├── market_data.py    # yfinance OHLCV + fundamentals
@@ -60,11 +61,12 @@ financial-qa-agent/
 │   ├── conftest.py        # Shared test fixtures
 │   ├── test_api.py        # API endpoint tests
 │   ├── test_agent.py      # LangGraph pipeline tests
+│   ├── test_models.py     # Pydantic model unit tests
 │   └── test_tools.py      # Tool unit tests
 ├── frontend/
-│   ├── index.html         # Demo web page
-│   ├── style.css
-│   └── app.js
+│   ├── index.html         # Two-panel layout + marked.js/DOMPurify CDN
+│   ├── style.css          # Grid layout, markdown styles, trace entries
+│   └── app.js             # SSE streaming, markdown rendering, trace panel
 ├── specs/
 │   ├── api.md             # API specification
 │   ├── architecture.md    # Architecture overview
@@ -81,5 +83,7 @@ financial-qa-agent/
 - Tests: `uv run pytest`
 
 ### 7. API Design
-- Single product endpoint: `POST /api/ask` — receives a financial question, returns an answer.
-- All responses follow: `{"status": "ok"|"error", "data": ..., "message": "..."}`
+- Batch endpoint: `POST /api/ask` — receives a financial question, returns an answer (JSON envelope).
+- Streaming endpoint: `POST /api/ask/stream` — SSE stream with progressive trace events + final answer.
+- All batch responses follow: `{"status": "ok"|"error", "data": ..., "message": "..."}`
+- SSE events: `trace`, `tool_input`, `tool_output`, `answer`, `error`, `done`

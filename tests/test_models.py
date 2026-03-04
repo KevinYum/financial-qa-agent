@@ -1,0 +1,270 @@
+"""Unit tests for Pydantic models."""
+
+import pytest
+
+from src.financial_qa_agent.models import (
+    AnswerEvent,
+    ErrorEvent,
+    HistoryRecord,
+    KnowledgeResult,
+    NewsResult,
+    ParseResultModel,
+    TickerData,
+    ToolInputEvent,
+    ToolOutputEvent,
+    TraceEvent,
+)
+
+
+# ---------------------------------------------------------------------------
+# Market Data Models
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryRecord:
+    """Tests for HistoryRecord model."""
+
+    def test_basic_construction(self):
+        record = HistoryRecord(
+            date="2024-01-15",
+            open=150.0,
+            high=155.0,
+            low=149.0,
+            close=153.0,
+            volume=1000000,
+        )
+        assert record.date == "2024-01-15"
+        assert record.close == 153.0
+        assert record.volume == 1000000
+
+    def test_model_dump(self):
+        record = HistoryRecord(
+            date="2024-01-15", open=150.0, high=155.0,
+            low=149.0, close=153.0, volume=1000000,
+        )
+        d = record.model_dump()
+        assert d["date"] == "2024-01-15"
+        assert isinstance(d, dict)
+
+
+class TestTickerData:
+    """Tests for TickerData model with alias handling."""
+
+    def test_basic_construction(self):
+        data = TickerData(ticker="AAPL", name="Apple Inc.")
+        assert data.ticker == "AAPL"
+        assert data.current_price is None
+        assert data.recent_history == []
+
+    def test_alias_roundtrip(self):
+        """w52_high/w52_low fields serialize to 52w_high/52w_low via alias."""
+        data = TickerData(
+            ticker="AAPL",
+            name="Apple Inc.",
+            w52_high=180.0,
+            w52_low=120.0,
+        )
+        d = data.model_dump(by_alias=True)
+        assert d["52w_high"] == 180.0
+        assert d["52w_low"] == 120.0
+        assert "w52_high" not in d
+
+    def test_construct_from_alias(self):
+        """TickerData can be constructed using the alias key names."""
+        data = TickerData(**{"ticker": "AAPL", "name": "Apple", "52w_high": 180.0})
+        assert data.w52_high == 180.0
+
+    def test_full_construction(self):
+        data = TickerData(
+            ticker="AAPL",
+            name="Apple Inc.",
+            current_price=150.0,
+            market_cap=2_500_000_000_000,
+            pe_ratio=28.5,
+            w52_high=180.0,
+            w52_low=120.0,
+            sector="Technology",
+            industry="Consumer Electronics",
+            recent_history=[
+                HistoryRecord(
+                    date="2024-01-15", open=150.0, high=155.0,
+                    low=149.0, close=153.0, volume=1000000,
+                ),
+            ],
+        )
+        d = data.model_dump(by_alias=True)
+        assert d["ticker"] == "AAPL"
+        assert d["current_price"] == 150.0
+        assert len(d["recent_history"]) == 1
+        assert d["recent_history"][0]["date"] == "2024-01-15"
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Base Model
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeResult:
+    """Tests for KnowledgeResult model."""
+
+    def test_defaults(self):
+        result = KnowledgeResult(text="Some knowledge")
+        assert result.source == "local"
+        assert result.title == ""
+
+    def test_with_url(self):
+        result = KnowledgeResult(
+            text="ETF Guide",
+            source="https://example.com/etf",
+            title="ETF Basics",
+        )
+        d = result.model_dump()
+        assert d["source"] == "https://example.com/etf"
+        assert d["title"] == "ETF Basics"
+
+
+# ---------------------------------------------------------------------------
+# News Search Model
+# ---------------------------------------------------------------------------
+
+
+class TestNewsResult:
+    """Tests for NewsResult model."""
+
+    def test_defaults(self):
+        result = NewsResult()
+        assert result.title == "No title"
+        assert result.description == "No description"
+        assert result.url == ""
+        assert result.age == ""
+
+    def test_from_api_data(self):
+        result = NewsResult(
+            title="Apple Earnings",
+            description="Beats estimates",
+            url="https://example.com/apple",
+            age="2d",
+        )
+        assert result.title == "Apple Earnings"
+        assert result.age == "2d"
+
+
+# ---------------------------------------------------------------------------
+# ParseResultModel
+# ---------------------------------------------------------------------------
+
+
+class TestParseResultModel:
+    """Tests for ParseResultModel (validation companion)."""
+
+    def test_defaults(self):
+        """All fields have sensible defaults."""
+        model = ParseResultModel()
+        d = model.model_dump()
+        assert d["tickers"] == []
+        assert d["company_names"] == []
+        assert d["time_period"] is None
+        assert d["needs_news"] is False
+        assert d["knowledge_queries"] == []
+
+    def test_validates_llm_output(self):
+        """Typical LLM JSON output is validated correctly."""
+        llm_output = {
+            "tickers": ["AAPL"],
+            "company_names": ["Apple"],
+            "time_period": "5d",
+            "time_start": None,
+            "time_end": None,
+            "asset_type": "equity",
+            "sector": None,
+            "needs_news": True,
+            "news_query": "Apple earnings",
+            "knowledge_queries": [],
+        }
+        model = ParseResultModel(**llm_output)
+        assert model.tickers == ["AAPL"]
+        assert model.needs_news is True
+        assert model.news_query == "Apple earnings"
+
+    def test_extra_fields_ignored(self):
+        """Extra fields from LLM are silently dropped."""
+        data = {"tickers": [], "unexpected_field": "ignored"}
+        model = ParseResultModel(**data)
+        assert model.tickers == []
+        assert not hasattr(model, "unexpected_field")
+
+    def test_partial_output_gets_defaults(self):
+        """Missing fields get defaults (handles incomplete LLM output)."""
+        data = {"tickers": ["TSLA"]}
+        model = ParseResultModel(**data)
+        assert model.tickers == ["TSLA"]
+        assert model.needs_news is False
+        assert model.knowledge_queries == []
+
+    def test_valid_time_periods_accepted(self):
+        """All valid yfinance period strings are accepted."""
+        valid = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
+        for period in valid:
+            model = ParseResultModel(time_period=period)
+            assert model.time_period == period
+
+    def test_invalid_time_period_coerced_to_none(self):
+        """Invalid time_period values (e.g. '2w') are coerced to None."""
+        invalid = ["2w", "4mo", "2d", "3y", "1w", "15d", "half_month"]
+        for period in invalid:
+            model = ParseResultModel(time_period=period)
+            assert model.time_period is None, f"Expected None for {period!r}, got {model.time_period!r}"
+
+    def test_none_time_period_stays_none(self):
+        """None time_period is preserved."""
+        model = ParseResultModel(time_period=None)
+        assert model.time_period is None
+
+
+# ---------------------------------------------------------------------------
+# Trace Event Models
+# ---------------------------------------------------------------------------
+
+
+class TestTraceEvents:
+    """Tests for trace event models."""
+
+    def test_trace_event(self):
+        event = TraceEvent(stage="parse", status="started", detail="Parsing...")
+        d = event.model_dump()
+        assert d["event_type"] == "trace"
+        assert d["stage"] == "parse"
+        assert d["status"] == "started"
+
+    def test_trace_event_with_tools(self):
+        event = TraceEvent(
+            stage="route", status="completed",
+            detail="Routing", tools=["fetch_market_data"],
+        )
+        d = event.model_dump()
+        assert d["tools"] == ["fetch_market_data"]
+
+    def test_tool_input_event(self):
+        event = ToolInputEvent(tool="market_data", input={"tickers": ["AAPL"]})
+        d = event.model_dump()
+        assert d["event_type"] == "tool_input"
+        assert d["tool"] == "market_data"
+        assert d["input"]["tickers"] == ["AAPL"]
+
+    def test_tool_output_event(self):
+        event = ToolOutputEvent(tool="market_data", output="AAPL: $150")
+        d = event.model_dump()
+        assert d["event_type"] == "tool_output"
+        assert d["output"] == "AAPL: $150"
+
+    def test_answer_event(self):
+        event = AnswerEvent(answer="The stock is at $150.")
+        d = event.model_dump()
+        assert d["event_type"] == "answer"
+        assert d["answer"] == "The stock is at $150."
+
+    def test_error_event(self):
+        event = ErrorEvent(message="Something went wrong")
+        d = event.model_dump()
+        assert d["event_type"] == "error"
+        assert d["message"] == "Something went wrong"

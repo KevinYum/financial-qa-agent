@@ -4,7 +4,7 @@ All user instructions that drive project direction are recorded here with timest
 
 ---
 
-## v0.0.1 — 2026-03-04T10:00:00Z — Project Initialization
+## v0.0.1 — 2026-03-04T05:24:08Z — Project Initialization
 
 **Instruction**:
 > Initialize this workspace using claude standard with rule and spec.
@@ -26,7 +26,7 @@ All user instructions that drive project direction are recorded here with timest
 
 ---
 
-## v0.0.2 — 2026-03-04T10:30:00Z — README with Architecture Diagrams
+## v0.0.2 — 2026-03-04T05:24:08Z — README with Architecture Diagrams
 
 **Instruction**:
 > I need a README created and maintained along with the project.
@@ -48,7 +48,7 @@ All user instructions that drive project direction are recorded here with timest
 
 ---
 
-## v0.0.3 — 2026-03-04T11:00:00Z — Project Structure Fix + Agent Loop Design
+## v0.0.3 — 2026-03-04T05:24:08Z — Project Structure Fix + Agent Loop Design
 
 **Instruction**:
 > 1. Project structure should be text-based like `folderA/... --- what is the content or file usage`, not in diagram.
@@ -61,7 +61,7 @@ All user instructions that drive project direction are recorded here with timest
 
 ---
 
-## v0.0.4 — 2026-03-04T12:00:00Z — LangGraph Agent Loop Implementation
+## v0.0.4 — 2026-03-04T05:24:08Z — LangGraph Agent Loop Implementation
 
 **Instruction**:
 > - Let's keep it pluggable but we can start with OpenAI, also the OpenRouter should be a valid option
@@ -108,7 +108,7 @@ All user instructions that drive project direction are recorded here with timest
 
 ---
 
-## v0.0.5 — 2026-03-04T13:00:00Z — Documentation Cleanup
+## v0.0.5 — 2026-03-04T05:24:08Z — Documentation Cleanup
 
 **Instruction**:
 > 1. Instruction log is missing major design decisions made during the agent loop implementation (v0.4.0).
@@ -121,7 +121,7 @@ All user instructions that drive project direction are recorded here with timest
 
 ---
 
-## v0.0.6 — 2026-03-04T14:00:00Z — Versioning Fix + ChromaDB Embedding Clarification
+## v0.0.6 — 2026-03-04T05:24:08Z — Versioning Fix + ChromaDB Embedding Clarification
 
 **Instruction**:
 > 1. All current instructions should be in version 0.0.x, will bump to 0.1.x when called out.
@@ -136,7 +136,7 @@ All user instructions that drive project direction are recorded here with timest
 
 ---
 
-## v0.0.7 — 2026-03-04T16:00:00Z — Parse-Driven Routing (Remove Classification)
+## v0.0.7 — 2026-03-04T05:24:08Z — Parse-Driven Routing (Remove Classification)
 
 **Instruction**:
 > 1. The agent loop should have a different structure: before classify, you need to understand the user question using an LLM call and identify tickers, timespan, and knowledge questions.
@@ -168,5 +168,224 @@ All user instructions that drive project direction are recorded here with timest
 - All 40 tests passing
 - Rewrote `specs/agent.md` for parse → fetch → synthesize flow
 - Updated `README.md`: agent loop diagram, system architecture, interaction pattern, test counts
+
+---
+
+## v0.0.8 — 2026-03-04T05:24:08Z — Trace Window with SSE Streaming
+
+**Instruction**:
+> Apart from the current main session window in front end, I also want you to add another trace window, this window have 4 tab:
+> 1. First tab progressively showing the current question's agent loop process, like in which stage and this stage is doing what, it should be consistent with the debug log in backend side (btw, tweak the default log level into debug in backend)
+> 2. 2,3,4 tab respectively shows the major input & output from different tools and should be reset after each new user question. For example on the market data tool, it should showing what are the query input including tickers, timespan, whether news, and also showing the api queried output. And trace output should be updated along with the project evolve.
+
+**Design Decisions**:
+1. **SSE (Server-Sent Events) for progressive updates** — The frontend needs real-time trace updates as each pipeline stage executes. SSE is simpler than WebSockets for this unidirectional stream. Since `EventSource` API is GET-only, the frontend uses `fetch()` with `ReadableStream` reader and parses SSE format manually from chunked responses.
+2. **`contextvars.ContextVar` for trace queue** — LangGraph node functions have fixed `(state) -> dict` signatures. A context variable avoids modifying node signatures, is task-local for concurrent requests, and is a no-op when unused (existing `ask()` stays untouched).
+3. **`asyncio.Queue` as event channel** — Trace events flow from agent nodes → queue → SSE generator. A `None` sentinel signals stream end. This decouples the agent execution from HTTP streaming.
+4. **Separate SSE endpoint** — New `POST /api/ask/stream` alongside existing `POST /api/ask` (backward compatibility preserved). SSE endpoint registered before static file mount (catch-all).
+5. **Two-panel frontend layout** — CSS Grid: chat panel (left) + trace panel (right) with 4 tabs (Agent Loop, Market Data, News Search, Knowledge Base). Responsive stacking below 900px.
+6. **Agent Loop tab** — Progressive timeline with in-place status updates (⏳ started → ✓ completed). Each trace event updates the corresponding stage entry.
+7. **Tool tabs** — Show tool input (query parameters) and output (fetched data) in monospace blocks. Reset on each new question.
+8. **DEBUG logging in all tools** — Added `logging.getLogger(__name__)` and debug statements to market_data, news_search, and knowledge_base modules. Backend default log level set to DEBUG.
+
+**Actions Taken**:
+- Rewrote `src/financial_qa_agent/agent.py`:
+  - Added contextvars-based trace infrastructure (`_trace_queue`, `_emit_trace`, `_emit_trace_sync`)
+  - Instrumented all 5 nodes + routing function with trace events
+  - Added `FinancialQAAgent.ask_with_trace(question, trace_queue)` method
+  - Existing `ask()` unchanged — `_emit_trace` is a no-op without queue
+- Rewrote `src/financial_qa_agent/main.py`:
+  - Added `logging.basicConfig(level=logging.DEBUG)`
+  - Added `POST /api/ask/stream` SSE endpoint with `StreamingResponse`
+  - App version bumped to `0.2.0`
+- Updated tool modules with DEBUG logging:
+  - `src/financial_qa_agent/tools/market_data.py`
+  - `src/financial_qa_agent/tools/news_search.py`
+  - `src/financial_qa_agent/tools/knowledge_base.py`
+- Rewrote `frontend/index.html` — two-panel layout with trace tabs
+- Rewrote `frontend/style.css` — grid layout, tab styles, trace entry styles
+- Rewrote `frontend/app.js` — SSE streaming, tab switching, trace rendering
+- Updated `tests/test_api.py`: +3 SSE tests (content type, events, error case) → 7 total
+- Updated `tests/test_agent.py`: +3 trace tests (event emission, empty question, no-op) → 18 total
+- All 46 tests passing
+- Updated `specs/api.md` — SSE endpoint with event type reference (v0.3.0)
+- Updated `specs/agent.md` — Trace Events section, updated public interface (v0.3.0)
+- Updated `specs/architecture.md` — SSE streaming, two-panel frontend, trace queue (v0.3.0)
+- Updated `CLAUDE.md` — API design, frontend file descriptions
+- Updated `README.md` — system architecture diagram (SSE flow), interaction pattern, project structure, API reference, test counts
+
+---
+
+## v0.0.9 — 2026-03-04T05:24:08Z — Two-Type Question Routing + Remove Regex Ticker Fallback
+
+**Instruction**:
+> 1. No longer need non-LLM fallback to parse tickers, we currently should only rely on parse node.
+> 2. After the parse phase, we differentiate two types of question:
+>    - Analysis for assets or markets
+>    - General knowledge Q/A
+> The indicator of type is whether there is a ticker to query live data later in tool calling. The type results in different answer format:
+>    - Analysis: two paragraphs — fact data with structured format, and analysis result
+>    - Knowledge: two paragraphs — the answer, and references including web search URLs
+> URL retention requires changes to the knowledge base tool for Brave web search metadata.
+>
+> Also: fix the timestamp in instructions.md — use actual system time when appending, not fake incremental hours.
+
+**Design Decisions**:
+1. **Removed regex ticker fallback** — `_extract_tickers()` regex function, `_STOP_WORDS` frozenset, and `SECTOR_ETFS` dict deleted from `market_data.py`. The parse LLM is now the sole source of ticker resolution (company names → tickers, sectors → ETFs, crypto/forex/index symbols). This simplifies the code and eliminates the risk of regex false positives.
+2. **Two-type question routing** — Questions are classified into exactly two types based on a single criterion: presence of tickers in the parse result. **Analysis** (tickers found) fetches market data + optional news, producing a data summary + analysis answer. **Knowledge** (no tickers) queries the knowledge base, producing an answer + references with URLs. This replaces the previous data-driven routing where any combination of tools could fire.
+3. **Behavioral changes from old routing**:
+   - `needs_news` without tickers → knowledge path (not news). The knowledge base falls back to Brave web search anyway, so news-style questions without specific tickers get answered via web search.
+   - `knowledge_queries` with tickers → analysis path (knowledge queries ignored). When tickers are present, the focus is on market data analysis, not conceptual knowledge.
+4. **Two type-specific synthesize prompts** — `SYNTHESIZE_ANALYSIS_PROMPT` instructs the LLM to produce (1) Data Summary with precise numbers, (2) Analysis with trends/context/news. `SYNTHESIZE_KNOWLEDGE_PROMPT` instructs (1) Answer with clear explanation, (2) References with `[Title](URL)` format.
+5. **URL/title metadata retention** — The knowledge base tool now stores title and URL metadata from Brave web search results in ChromaDB. Output format changed from `[n] text (source: url)` to `[n] text\n    Reference: [Title](url)` for easy extraction by the synthesize LLM.
+6. **State mutation in routing** — `question_type` is set directly on the state dict in `route_by_parse_result()`. **Note**: This mutation does not propagate to downstream nodes in LangGraph — fixed in v0.0.12 by having synthesize derive question type from data presence instead.
+
+**Actions Taken**:
+- Rewrote `src/financial_qa_agent/tools/market_data.py`:
+  - Deleted `import re`, `_STOP_WORDS`, `SECTOR_ETFS`, `_extract_tickers()`
+  - Simplified `fetch_market_data()` to use only parse_result tickers
+- Updated `src/financial_qa_agent/tools/knowledge_base.py`:
+  - `_brave_web_search()` now returns `title` field alongside `text` and `source`
+  - `_store_in_chromadb()` stores title in metadata
+  - `fetch_knowledge()` output format changed to `Reference: [Title](url)`
+- Rewrote `src/financial_qa_agent/agent.py`:
+  - Added `question_type: str` to `AgentState`
+  - Replaced single `SYNTHESIZE_PROMPT` with `SYNTHESIZE_ANALYSIS_PROMPT` and `SYNTHESIZE_KNOWLEDGE_PROMPT`
+  - Updated `synthesize_node()` to select prompt based on `question_type`
+  - Rewrote `route_by_parse_result()` for two-type routing
+  - Updated initial state in `ask()` and `ask_with_trace()`
+- Updated `tests/test_tools.py`:
+  - Deleted 7 regex-related tests (`TestExtractTickers`, `test_market_data_fetch_with_mock`, `test_market_data_entities_empty_falls_back_to_regex`)
+  - Replaced `test_market_data_sector_fallback` → `test_market_data_sector_via_parse`
+  - Added `test_market_data_empty_parse_result_no_tickers`, `test_knowledge_base_includes_reference_urls`
+- Updated `tests/test_agent.py`:
+  - Rewrote 6 routing tests with `question_type` assertions and new two-type behavior
+  - Rewrote 2 pipeline tests for new routing (`test_agent_pipeline_news_without_tickers_goes_to_knowledge`, `test_agent_pipeline_tickers_with_news`)
+  - Added 2 synthesize prompt selection tests
+- All 44 tests passing (7 API + 21 agent + 16 tools)
+- Updated `README.md` — agent loop diagram, interaction pattern, project structure (test counts, market_data description)
+- Updated `specs/agent.md` — state schema, graph topology, routing logic, fetch_market_data, fetch_knowledge, synthesize sections (v0.4.0)
+- Updated `specs/architecture.md` — overview, pipeline, data flow, tool descriptions (v0.4.0)
+
+---
+
+## v0.0.10 — 2026-03-04T05:39:18Z — Formalize Data Structures into Pydantic Models
+
+**Instruction**:
+> I want you to formalize the data structure in agent loop and also in tool calling and usage, they should be in structured and in model.py not in plain dict which makes it hard to maintain and understand.
+
+**Design Decisions**:
+1. **Centralized models.py** — All Pydantic models in a single file (`src/financial_qa_agent/models.py`) with no dependencies on other project modules. This is the single source of truth for all structured data shapes flowing through the pipeline.
+2. **LangGraph TypedDict preserved** — `AgentState` and `ParseResult` remain as `TypedDict` in `agent.py` because LangGraph requires this. Pydantic models serve as validation companions: construct model → `.model_dump()` → insert into state.
+3. **Alias handling for `52w_high`/`52w_low`** — These aren't valid Python identifiers. Solved with `Field(alias="52w_high")` + `ConfigDict(populate_by_name=True)`. Tools use `.model_dump(by_alias=True)` to preserve backward-compatible dict keys consumed by `_format_ticker_data()`.
+4. **ParseResultModel for LLM validation** — The parse node now validates LLM JSON through `ParseResultModel(**parsed).model_dump()`, which provides sensible defaults for missing fields (e.g., `tickers=[]`, `needs_news=False`) and catches type errors from malformed LLM output. Extra fields from LLM are silently dropped (no `extra='forbid'`).
+5. **Typed trace events** — `TraceEvent`, `ToolInputEvent`, `ToolOutputEvent`, `AnswerEvent`, `ErrorEvent` use `Literal` types for `event_type` fields. All trace emit call sites now use model constructors + `.model_dump()` spread for validation while keeping the generic `_emit_trace(**kwargs)` signature unchanged.
+6. **Tool function signatures unchanged** — All tool functions still accept `parse_result: dict | None` for compatibility. Models are used internally for construction and validation, not as interface types.
+
+**Actions Taken**:
+- Created `src/financial_qa_agent/models.py` with 10 Pydantic models:
+  - Market data: `HistoryRecord`, `TickerData`
+  - Knowledge base: `KnowledgeResult`
+  - News search: `NewsResult`
+  - Parse validation: `ParseResultModel`
+  - Trace events: `TraceEvent`, `ToolInputEvent`, `ToolOutputEvent`, `AnswerEvent`, `ErrorEvent`
+- Updated `src/financial_qa_agent/tools/market_data.py` — imports and uses `HistoryRecord`, `TickerData`
+- Updated `src/financial_qa_agent/tools/news_search.py` — imports and uses `NewsResult`
+- Updated `src/financial_qa_agent/tools/knowledge_base.py` — imports and uses `KnowledgeResult`
+- Updated `src/financial_qa_agent/agent.py` — imports `ParseResultModel` and all trace event models; parse node validates through `ParseResultModel`; all trace emit sites use model constructors
+- Created `tests/test_models.py` — 20 tests covering all models (alias roundtrip, defaults, validation, trace event shapes)
+- All 64 tests passing (7 API + 21 agent + 20 models + 16 tools)
+- Updated `CLAUDE.md` — project structure (added `models.py`, `test_models.py`)
+- Updated `README.md` — project structure (added `models.py`, `test_models.py`, test counts)
+- Updated `specs/architecture.md` — added Data Models section, updated tool descriptions (v0.5.0)
+- Updated `specs/agent.md` — added Data Models section, updated parse node and trace events descriptions (v0.5.0)
+
+---
+
+## v0.0.11 — 2026-03-04T05:50:36Z — Sectioned Answer Format with Markdown Rendering
+
+**Instruction**:
+> For the analysis and knowledge type, each different type's return has several paragraphs:
+> 1. Each paragraph should have a user-visible delimiter, with bigger paragraph title like "Fact" and "Analysis"
+> 2. It's correct that we may have news in the analysis part, which should be in another section called "References"
+> 3. The front end when having URL is not correctly populated — URLs should be clickable
+> 4. Markdown should be correctly populated in frontend, not forced into some custom HTML format
+
+**Design Decisions**:
+1. **Section-delimited answer format** — Replaced the old "two paragraphs separated by a blank line" instruction with explicit `##` markdown headers. The LLM now produces structured sections: `## Fact`, `## Analysis`, `## References` (analysis type) or `## Answer`, `## References` (knowledge type). The `## References` section is omitted entirely for analysis when no news data is available.
+2. **Proper markdown rendering via marked.js** — Instead of a hand-rolled HTML converter that would need to handle every markdown feature, the frontend uses `marked.js` (CDN) to render LLM markdown output correctly. This handles `##` headers, `**bold**`, `[links](url)`, `- bullets`, paragraphs, tables, code blocks, and any other markdown the LLM produces — all natively.
+3. **DOMPurify for sanitization** — All `marked.parse()` output is passed through `DOMPurify.sanitize()` before inserting into the DOM. This is defense-in-depth against any XSS that could come from LLM output. Links get `target="_blank"` and `rel="noopener noreferrer"` applied after sanitization.
+4. **CSS scoped to `.msg.agent`** — Standard HTML elements (`h2`, `p`, `ul`, `li`, `a`, `strong`, `code`, `table`) are styled under `.msg.agent` to look correct within the chat bubble. `h2` gets the blue uppercase title treatment with border. Links are blue and underlined. User and error messages retain `white-space: pre-wrap`; agent messages use normal whitespace with HTML rendering.
+
+**Actions Taken**:
+- Rewrote `SYNTHESIZE_ANALYSIS_PROMPT` in `agent.py` — 3 sections: `## Fact`, `## Analysis`, `## References` (conditional)
+- Rewrote `SYNTHESIZE_KNOWLEDGE_PROMPT` in `agent.py` — 2 sections: `## Answer`, `## References`
+- Updated `frontend/index.html` — added `marked.min.js` and `purify.min.js` via CDN
+- Updated `frontend/app.js`:
+  - Configured `marked` with `breaks: true` and `gfm: true`
+  - `addMessage()` now uses `marked.parse()` + `DOMPurify.sanitize()` for agent messages
+  - Removed custom `renderAgentAnswer()` and `renderMarkdownBody()` — no longer needed
+  - Links get `target="_blank"` applied after rendering
+- Updated `frontend/style.css`:
+  - Replaced custom `.answer-section*` and `.answer-bullet` classes with standard element styles under `.msg.agent` (`h2`, `p`, `ul`, `li`, `a`, `strong`, `code`, `table`)
+  - Moved `white-space: pre-wrap` from `.msg` to `.msg.user, .msg.error` only
+- Updated `tests/test_agent.py` — synthesize prompt assertions now check for `## Fact`, `## Analysis`, `## Answer`, `## References`
+- All 64 tests passing
+- Updated `specs/agent.md` — synthesize node and routing table reflect sectioned answer format
+- Updated `README.md` — interaction pattern and agent loop diagram reflect sectioned answers with markdown rendering
+
+---
+
+## v0.0.12 — 2026-03-04T05:59:05Z — Fix Analysis Prompt Selection (question_type State Bug)
+
+**Instruction**:
+> The current analysis result is not following Fact, Analysis, optional Reference paragraph, but also uses the knowledge QA's Answer and Reference paragraph format. Find the reason and fix.
+
+**Root Cause**:
+The `route_by_parse_result()` function set `state["question_type"] = "analysis"` via direct dict mutation. However, LangGraph routing functions are used only to determine which nodes to route to — they don't return state updates like nodes do. Direct state mutations in a routing function are not propagated to subsequent nodes. When `synthesize_node()` ran `state.get("question_type", "knowledge")`, the mutation was lost and it always defaulted to `"knowledge"`, causing all questions to use the knowledge prompt format (`## Answer` + `## References`) instead of the analysis format (`## Fact` + `## Analysis` + `## References`).
+
+**Design Decision**:
+1. **Derive question type from data, not state field** — The synthesize node now determines question type by checking whether `market_data` is non-empty: `"analysis" if state.get("market_data") else "knowledge"`. This is reliable because `market_data` is set by `fetch_market_data_node()` which properly returns a state update dict. This eliminates the dependency on a routing-function state mutation that LangGraph doesn't propagate.
+2. **Routing function mutation kept for tracing** — The `state["question_type"] = "analysis"` line in `route_by_parse_result()` is retained for trace event detail logging, but documented as non-authoritative. The synthesize node does not read it.
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/agent.py`:
+  - `synthesize_node()`: replaced `state.get("question_type", "knowledge")` with `"analysis" if state.get("market_data") else "knowledge"`
+  - Updated docstring explaining the derivation logic and why it's needed
+  - `route_by_parse_result()`: updated docstring noting that state mutation is for tracing only
+- Updated `tests/test_agent.py`:
+  - `test_synthesize_uses_analysis_prompt`: `question_type` set to `""` (not `"analysis"`) to prove synthesize derives type from `market_data`
+  - `test_synthesize_uses_knowledge_prompt`: `question_type` set to `""` (not `"knowledge"`) to prove synthesize derives type from empty `market_data`
+- All 64 tests passing
+- Updated `specs/agent.md` — synthesize node and routing logic sections reflect data-driven prompt selection
+
+---
+
+## v0.0.13 — 2026-03-04T06:31:32Z — Constrain time_period to Valid yfinance Values
+
+**Instruction**:
+> When parsing the time period, you should pass in all feasible period, or I will hit the case when I ask the past half month, the parse will produce "2w" as period but 2w is not feasible, it should return 1mo which contains 2w data point.
+
+**Design Decisions**:
+1. **Explicit enumeration in parse prompt** — The prompt now lists all 11 valid yfinance period values (`1d`, `5d`, `1mo`, `3mo`, `6mo`, `1y`, `2y`, `5y`, `10y`, `ytd`, `max`) and explicitly states "No other values are valid — do NOT invent periods like 2w, 2d, 4mo, etc." with comprehensive mapping examples covering ambiguous cases (e.g., "past 2 weeks" → `1mo`, "9 months" → `1y`, "18 months" → `2y`).
+2. **Round-up strategy** — The LLM is instructed to "always pick the smallest valid period that fully covers the requested range". For example, "past half month" (~15 days) → `1mo` (not `5d` which is too short, not `3mo` which is excessive). This ensures users always get data that covers their requested range.
+3. **Pydantic field_validator as safety net** — Added a `field_validator("time_period")` on `ParseResultModel` that coerces any value not in `VALID_TIME_PERIODS` to `None`. This provides defense-in-depth: if the LLM still produces `"2w"`, the validator catches it and the downstream market_data tool falls back to its default period (`"5d"`). The `VALID_TIME_PERIODS` frozenset is defined once in `models.py` and mirrors the one in `market_data.py`.
+
+**Actions Taken**:
+- Updated `PARSE_PROMPT` in `src/financial_qa_agent/agent.py`:
+  - Replaced loose time_period instructions with explicit enumeration of all valid values
+  - Added "do NOT invent periods" constraint
+  - Comprehensive mapping examples with round-up-to-cover semantics
+- Updated `src/financial_qa_agent/models.py`:
+  - Added `VALID_TIME_PERIODS` frozenset
+  - Added `@field_validator("time_period")` on `ParseResultModel` to coerce invalid values to `None`
+  - Added `field_validator` to Pydantic imports
+- Added 3 tests in `tests/test_models.py`:
+  - `test_valid_time_periods_accepted` — all 11 valid periods accepted
+  - `test_invalid_time_period_coerced_to_none` — invalid values (`2w`, `4mo`, `2d`, etc.) coerced to `None`
+  - `test_none_time_period_stays_none` — `None` preserved
+- All 67 tests passing (7 API + 21 agent + 23 models + 16 tools)
+- Updated `specs/agent.md` — parse node describes time_period constraint; state schema updated
+- Updated `specs/architecture.md` — ParseResultModel description includes field_validator
 
 ---

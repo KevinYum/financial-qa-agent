@@ -5,47 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
-# Market Data Tool — Ticker Extraction (regex fallback)
-# ---------------------------------------------------------------------------
-
-
-class TestExtractTickers:
-    """Tests for ticker extraction from question text."""
-
-    def test_dollar_sign_tickers(self):
-        from src.financial_qa_agent.tools.market_data import _extract_tickers
-
-        result = _extract_tickers("Compare $TSLA and $GOOG")
-        assert "TSLA" in result
-        assert "GOOG" in result
-
-    def test_uppercase_tickers(self):
-        from src.financial_qa_agent.tools.market_data import _extract_tickers
-
-        result = _extract_tickers("What is the price of AAPL?")
-        assert "AAPL" in result
-
-    def test_filters_common_words(self):
-        from src.financial_qa_agent.tools.market_data import _extract_tickers
-
-        result = _extract_tickers("What is inflation?")
-        assert result == []
-
-    def test_deduplicates(self):
-        from src.financial_qa_agent.tools.market_data import _extract_tickers
-
-        result = _extract_tickers("$AAPL and AAPL stock")
-        assert result.count("AAPL") == 1
-
-    def test_no_tickers(self):
-        from src.financial_qa_agent.tools.market_data import _extract_tickers
-
-        result = _extract_tickers("How does compound interest work?")
-        assert result == []
-
-
-# ---------------------------------------------------------------------------
-# Market Data Tool — fetch_market_data (no entities / regex fallback)
+# Market Data Tool — fetch_market_data (no parse result / no tickers)
 # ---------------------------------------------------------------------------
 
 
@@ -56,36 +16,6 @@ async def test_market_data_no_tickers():
 
     result = await fetch_market_data("What is inflation?")
     assert "No stock tickers" in result
-
-
-@pytest.mark.asyncio
-async def test_market_data_fetch_with_mock():
-    """Market data fetch with mocked yfinance (regex fallback path)."""
-    mock_ticker = MagicMock()
-    mock_ticker.info = {
-        "longName": "Apple Inc.",
-        "currentPrice": 150.0,
-        "marketCap": 2_500_000_000_000,
-        "trailingPE": 28.5,
-        "fiftyTwoWeekHigh": 180.0,
-        "fiftyTwoWeekLow": 120.0,
-        "sector": "Technology",
-        "industry": "Consumer Electronics",
-    }
-    mock_hist = MagicMock()
-    mock_hist.empty = True
-    mock_ticker.history.return_value = mock_hist
-
-    with patch(
-        "src.financial_qa_agent.tools.market_data.yf.Ticker",
-        return_value=mock_ticker,
-    ):
-        from src.financial_qa_agent.tools.market_data import fetch_market_data
-
-        result = await fetch_market_data("Price of AAPL?")
-        assert "Apple Inc." in result
-        assert "150" in result
-        assert "Technology" in result
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +98,8 @@ async def test_market_data_entities_date_range():
 
 
 @pytest.mark.asyncio
-async def test_market_data_sector_fallback():
-    """Sector queries resolve to sector ETF when no tickers provided."""
+async def test_market_data_sector_via_parse():
+    """Sector queries use sector ETF ticker from parse result."""
     mock_ticker = MagicMock()
     mock_ticker.info = {
         "longName": "Technology Select Sector SPDR Fund",
@@ -185,9 +115,10 @@ async def test_market_data_sector_fallback():
     ) as mock_yf:
         from src.financial_qa_agent.tools.market_data import fetch_market_data
 
+        # Parse LLM resolves "tech sector" → XLK ticker
         result = await fetch_market_data(
             "How is the tech sector doing?",
-            parse_result={"asset_type": "sector", "sector": "technology"},
+            parse_result={"tickers": ["XLK"], "asset_type": "sector", "sector": "technology"},
         )
         mock_yf.assert_called_with("XLK")
         assert "Technology Select Sector" in result
@@ -217,23 +148,12 @@ async def test_market_data_crypto_symbol():
 
 
 @pytest.mark.asyncio
-async def test_market_data_entities_empty_falls_back_to_regex():
-    """Empty parse_result dict falls back to regex ticker extraction."""
-    mock_ticker = MagicMock()
-    mock_ticker.info = {"longName": "Apple Inc.", "currentPrice": 150.0}
-    mock_hist = MagicMock()
-    mock_hist.empty = True
-    mock_ticker.history.return_value = mock_hist
+async def test_market_data_empty_parse_result_no_tickers():
+    """Empty parse_result dict returns no-tickers message (no regex fallback)."""
+    from src.financial_qa_agent.tools.market_data import fetch_market_data
 
-    with patch(
-        "src.financial_qa_agent.tools.market_data.yf.Ticker",
-        return_value=mock_ticker,
-    ) as mock_yf:
-        from src.financial_qa_agent.tools.market_data import fetch_market_data
-
-        result = await fetch_market_data("Price of AAPL?", parse_result={})
-        mock_yf.assert_called_with("AAPL")
-        assert "Apple Inc." in result
+    result = await fetch_market_data("Price of AAPL?", parse_result={})
+    assert "No stock tickers" in result
 
 
 @pytest.mark.asyncio
@@ -421,6 +341,7 @@ async def test_knowledge_base_fallback_to_web():
 
         result = await fetch_knowledge("What are options?")
         assert "Options Trading Guide" in result
+        assert "Reference:" in result
 
 
 @pytest.mark.asyncio
@@ -505,3 +426,56 @@ async def test_knowledge_base_uses_knowledge_queries():
             },
         )
         assert "option" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_base_includes_reference_urls():
+    """Knowledge base output includes Reference: [Title](URL) format for web results."""
+    import chromadb
+
+    client = chromadb.Client()
+    collection = client.create_collection(
+        "test_kb_refs", metadata={"hnsw:space": "cosine"}
+    )
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "web": {
+            "results": [
+                {
+                    "title": "ETF Basics Guide",
+                    "description": "A guide to exchange-traded funds.",
+                    "url": "https://example.com/etf-guide",
+                },
+            ]
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+
+    mock_http_client = AsyncMock()
+    mock_http_client.get.return_value = mock_response
+    mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+    mock_http_client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch(
+            "src.financial_qa_agent.tools.knowledge_base._get_collection",
+            return_value=collection,
+        ),
+        patch(
+            "src.financial_qa_agent.tools.knowledge_base.settings"
+        ) as mock_settings,
+        patch(
+            "src.financial_qa_agent.tools.knowledge_base.httpx.AsyncClient",
+            return_value=mock_http_client,
+        ),
+    ):
+        mock_settings.brave_api_key = "test-key"
+        mock_settings.kb_min_results = 2
+        mock_settings.kb_max_distance = 0.5
+        from src.financial_qa_agent.tools.knowledge_base import fetch_knowledge
+
+        result = await fetch_knowledge("What is an ETF?")
+        # Verify markdown reference format
+        assert "Reference:" in result
+        assert "[ETF Basics Guide](https://example.com/etf-guide)" in result

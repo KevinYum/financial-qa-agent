@@ -1,65 +1,19 @@
 """Market data tool — fetches OHLCV and fundamentals via yfinance."""
 
 import asyncio
-import re
+import logging
 from functools import partial
 
 import yfinance as yf
 
-# Common English words that look like tickers but aren't
-_STOP_WORDS = frozenset({
-    "A", "I", "AM", "IS", "IT", "AT", "IN", "ON", "TO", "THE", "AND", "OR",
-    "FOR", "OF", "BY", "AN", "AS", "IF", "DO", "SO", "UP", "MY", "ME", "WE",
-    "US", "BE", "NO", "NOT", "BUT", "HOW", "HAS", "HAD", "ARE", "WAS", "ALL",
-    "CAN", "HER", "HIS", "ITS", "MAY", "NEW", "NOW", "OLD", "OUR", "OUT",
-    "OWN", "SAY", "SHE", "TOO", "USE", "WAY", "WHO", "DID", "GET", "HIM",
-    "LET", "PUT", "RUN", "SET", "TOP", "WHY", "BIG", "END", "DAY", "GOT",
-    "LOW", "HIGH", "VS", "ETF", "IPO", "CEO", "CFO", "GDP", "SEC", "FED",
-    "NYSE", "WHAT", "WHEN", "WILL", "WITH", "THAT", "THIS", "FROM", "HAVE",
-    "BEEN", "THAN", "THEM", "THEN", "THEY", "ABOUT", "AFTER", "COULD", "WOULD",
-    "SHOULD", "THEIR", "THERE", "THESE", "THOSE", "WHERE", "WHICH", "WHILE",
-    "STOCK", "PRICE", "MUCH", "MANY", "SOME",
-})
+from ..models import HistoryRecord, TickerData
+
+logger = logging.getLogger(__name__)
 
 # Valid yfinance period strings
 VALID_PERIODS = frozenset({
     "1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max",
 })
-
-# SPDR sector ETF mapping (fallback when LLM doesn't resolve to tickers)
-SECTOR_ETFS: dict[str, str] = {
-    "technology": "XLK",
-    "healthcare": "XLV",
-    "financials": "XLF",
-    "energy": "XLE",
-    "consumer_discretionary": "XLY",
-    "consumer_staples": "XLP",
-    "industrials": "XLI",
-    "materials": "XLB",
-    "utilities": "XLU",
-    "real_estate": "XLRE",
-    "communication_services": "XLC",
-}
-
-
-def _extract_tickers(question: str) -> list[str]:
-    """Extract stock ticker symbols from a question string (regex fallback).
-
-    Looks for $TICKER patterns and standalone uppercase 1-5 letter words.
-    Filters out common English words.
-    """
-    # Match $TICKER pattern
-    dollar_tickers = re.findall(r"\$([A-Z]{1,5})", question.upper())
-    # Match standalone uppercase words 1-5 chars in original text
-    word_tickers = re.findall(r"\b([A-Z]{1,5})\b", question)
-    # Deduplicate, preserve order, filter stop words
-    seen: set[str] = set()
-    result: list[str] = []
-    for t in dollar_tickers + word_tickers:
-        if t not in seen and t not in _STOP_WORDS:
-            seen.add(t)
-            result.append(t)
-    return result
 
 
 def _fetch_ticker_data(
@@ -80,31 +34,32 @@ def _fetch_ticker_data(
     else:
         hist = t.history(period=period)
 
-    history_records: list[dict] = []
+    history_records: list[HistoryRecord] = []
     if not hist.empty:
         # Show at most last 10 data points regardless of period
         for date, row in hist.tail(10).iterrows():
-            history_records.append({
-                "date": str(date.date()),
-                "open": round(row.get("Open", 0), 2),
-                "high": round(row.get("High", 0), 2),
-                "low": round(row.get("Low", 0), 2),
-                "close": round(row.get("Close", 0), 2),
-                "volume": int(row.get("Volume", 0)),
-            })
+            history_records.append(HistoryRecord(
+                date=str(date.date()),
+                open=round(row.get("Open", 0), 2),
+                high=round(row.get("High", 0), 2),
+                low=round(row.get("Low", 0), 2),
+                close=round(row.get("Close", 0), 2),
+                volume=int(row.get("Volume", 0)),
+            ))
 
-    return {
-        "ticker": ticker,
-        "name": info.get("longName", ticker),
-        "current_price": info.get("currentPrice"),
-        "market_cap": info.get("marketCap"),
-        "pe_ratio": info.get("trailingPE"),
-        "52w_high": info.get("fiftyTwoWeekHigh"),
-        "52w_low": info.get("fiftyTwoWeekLow"),
-        "sector": info.get("sector"),
-        "industry": info.get("industry"),
-        "recent_history": history_records,
-    }
+    ticker_data = TickerData(
+        ticker=ticker,
+        name=info.get("longName", ticker),
+        current_price=info.get("currentPrice"),
+        market_cap=info.get("marketCap"),
+        pe_ratio=info.get("trailingPE"),
+        w52_high=info.get("fiftyTwoWeekHigh"),
+        w52_low=info.get("fiftyTwoWeekLow"),
+        sector=info.get("sector"),
+        industry=info.get("industry"),
+        recent_history=history_records,
+    )
+    return ticker_data.model_dump(by_alias=True)
 
 
 def _format_ticker_data(data: dict) -> str:
@@ -131,33 +86,29 @@ def _format_ticker_data(data: dict) -> str:
 
 
 async def fetch_market_data(question: str, parse_result: dict | None = None) -> str:
-    """Fetch market data for instruments mentioned in the question.
+    """Fetch market data for instruments identified by the parse node.
 
-    Resolution order for tickers:
-    1. LLM-extracted parse result (tickers field)
-    2. Regex fallback (_extract_tickers)
-    3. Sector ETF lookup (if asset_type is "sector")
+    Tickers come exclusively from parse_result (LLM extraction).
+    The parse LLM handles all resolution — company names to tickers,
+    sectors to ETFs, crypto/forex/index symbols.
 
     Time period comes from parse_result, defaults to "5d".
     """
     parse_result = parse_result or {}
 
-    # 1. Resolve tickers
+    # Tickers must come from LLM parse result — no fallback
     tickers = list(parse_result.get("tickers") or [])
-    if not tickers:
-        tickers = _extract_tickers(question)
-    if not tickers and parse_result.get("asset_type") == "sector":
-        sector = (parse_result.get("sector") or "").lower().replace(" ", "_")
-        etf = SECTOR_ETFS.get(sector)
-        if etf:
-            tickers = [etf]
 
     if not tickers:
+        logger.debug("No tickers in parse result for question: %r", question)
         return "No stock tickers or financial instruments identified in the question."
+
+    logger.debug("Resolved tickers: %s", tickers[:5])
 
     # 2. Resolve time parameters
     period = parse_result.get("time_period") or "5d"
     if period not in VALID_PERIODS:
+        logger.debug("Invalid period %r, defaulting to 5d", period)
         period = "5d"
     start = parse_result.get("time_start")
     end = parse_result.get("time_end")
@@ -166,9 +117,12 @@ async def fetch_market_data(question: str, parse_result: dict | None = None) -> 
     loop = asyncio.get_event_loop()
     results: list[dict] = []
     for ticker in tickers[:5]:  # Cap at 5 tickers for comparison queries
+        logger.debug("Fetching yfinance data: ticker=%s period=%s start=%s end=%s",
+                      ticker, period, start, end)
         data = await loop.run_in_executor(
             None, partial(_fetch_ticker_data, ticker, period, start, end)
         )
+        logger.debug("Fetched %s: price=%s", ticker, data.get("current_price"))
         results.append(data)
 
     parts = [_format_ticker_data(r) for r in results]

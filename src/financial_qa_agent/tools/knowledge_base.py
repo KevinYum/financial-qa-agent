@@ -7,11 +7,15 @@ automatically through this function.
 """
 
 import hashlib
+import logging
 
 import chromadb
 import httpx
 
 from ..config import settings
+from ..models import KnowledgeResult
+
+logger = logging.getLogger(__name__)
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 
@@ -76,10 +80,12 @@ async def _brave_web_search(query: str) -> list[dict]:
 
     results: list[dict] = []
     for r in data.get("web", {}).get("results", []):
-        results.append({
-            "text": f"{r.get('title', '')}: {r.get('description', '')}",
-            "source": r.get("url", ""),
-        })
+        result = KnowledgeResult(
+            text=f"{r.get('title', '')}: {r.get('description', '')}",
+            source=r.get("url", ""),
+            title=r.get("title", ""),
+        )
+        results.append(result.model_dump())
     return results
 
 
@@ -90,7 +96,9 @@ def _store_in_chromadb(collection: chromadb.Collection, results: list[dict]) -> 
 
     ids = [_doc_id(r["text"], r["source"]) for r in results]
     documents = [r["text"] for r in results]
-    metadatas = [{"source": r["source"]} for r in results]
+    metadatas = [
+        {"source": r["source"], "title": r.get("title", "")} for r in results
+    ]
 
     collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
 
@@ -111,6 +119,8 @@ async def fetch_knowledge(question: str, parse_result: dict | None = None) -> st
     # Use parsed knowledge queries if available, otherwise raw question
     queries = parse_result.get("knowledge_queries") or [question]
     query_text = " ".join(queries) if len(queries) > 1 else queries[0]
+    logger.debug("Knowledge base query: %r (from %d sub-queries)",
+                 query_text[:100], len(queries))
 
     results = collection.query(query_texts=[query_text], n_results=3)
 
@@ -120,16 +130,26 @@ async def fetch_knowledge(question: str, parse_result: dict | None = None) -> st
 
     # Filter by distance threshold
     good_results: list[dict] = [
-        {"text": doc, "source": meta.get("source", "local")}
+        KnowledgeResult(
+            text=doc,
+            source=meta.get("source", "local"),
+            title=meta.get("title", ""),
+        ).model_dump()
         for doc, dist, meta in zip(documents, distances, metadatas)
         if dist < settings.kb_max_distance
     ]
 
+    logger.debug("ChromaDB returned %d good results (threshold %.2f)",
+                 len(good_results), settings.kb_max_distance)
+
     if len(good_results) < settings.kb_min_results:
         # Fallback to Brave web search
         fallback_query = parse_result.get("news_query") or query_text
+        logger.debug("Sparse results — falling back to Brave: %r", fallback_query)
         web_results = await _brave_web_search(fallback_query)
         if web_results:
+            logger.debug("Brave fallback returned %d results, storing in ChromaDB",
+                         len(web_results))
             _store_in_chromadb(collection, web_results)
             good_results.extend(web_results)
 
@@ -138,7 +158,12 @@ async def fetch_knowledge(question: str, parse_result: dict | None = None) -> st
 
     parts: list[str] = []
     for i, r in enumerate(good_results, 1):
-        source_label = f" (source: {r['source']})" if r["source"] != "local" else ""
-        parts.append(f"[{i}] {r['text']}{source_label}")
+        source = r.get("source", "local")
+        title = r.get("title", "")
+        if source and source != "local":
+            ref_label = f"[{title}]({source})" if title else source
+            parts.append(f"[{i}] {r['text']}\n    Reference: {ref_label}")
+        else:
+            parts.append(f"[{i}] {r['text']}")
 
     return "\n\n".join(parts)

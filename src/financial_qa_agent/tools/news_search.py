@@ -1,8 +1,13 @@
 """News search tool — fetches financial news via Brave Search API."""
 
+import logging
+
 import httpx
 
 from ..config import settings
+from ..models import NewsResult
+
+logger = logging.getLogger(__name__)
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 
@@ -18,6 +23,8 @@ async def fetch_news(question: str, parse_result: dict | None = None) -> str:
 
     parse_result = parse_result or {}
     query = parse_result.get("news_query") or question
+    logger.debug("News search query: %r (from %s)",
+                 query, "parse_result" if parse_result.get("news_query") else "question")
 
     headers = {
         "Accept": "application/json",
@@ -38,17 +45,20 @@ async def fetch_news(question: str, parse_result: dict | None = None) -> str:
         data = response.json()
 
     results = data.get("web", {}).get("results", [])
+    logger.debug("News search returned %d results", len(results))
     if not results:
         return "No recent news found for this query."
 
     parts: list[str] = []
     for i, r in enumerate(results, 1):
-        title = r.get("title", "No title")
-        description = r.get("description", "No description")
-        url = r.get("url", "")
-        age = r.get("age", "")
+        news = NewsResult(
+            title=r.get("title", "No title"),
+            description=r.get("description", "No description"),
+            url=r.get("url", ""),
+            age=r.get("age", ""),
+        )
         parts.append(
-            f"[{i}] {title}\n    {description}\n    Source: {url}\n    Age: {age}"
+            f"[{i}] {news.title}\n    {news.description}\n    Source: {news.url}\n    Age: {news.age}"
         )
 
     return "\n\n".join(parts)
