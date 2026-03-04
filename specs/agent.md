@@ -1,6 +1,6 @@
 # Agent Specification
 
-**Version**: 0.8.0
+**Version**: 0.9.0
 **Last Updated**: 2026-03-04
 
 ## Overview
@@ -95,10 +95,14 @@ parse → route_by_parse_result (driven by question_type from parser)
 - Triggered on the knowledge path (no tickers in parse result)
 - Also serves as fallback when no other tools are triggered
 - Uses `knowledge_query` from parse result for ChromaDB search (single RAG-optimized query); falls back to raw question
-- **Embedding**: ChromaDB's default embedding function (all-MiniLM-L6-v2 via onnxruntime, 384-dim). Both `query(query_texts=...)` and `upsert(documents=...)` embed text automatically — no explicit embedding call or external API needed.
-- Filters by distance threshold (`kb_max_distance`, default 0.5)
+- **Embedding**: ChromaDB's default embedding function (all-MiniLM-L6-v2 via onnxruntime, 384-dim, **256-token max**). The model silently truncates input beyond 256 tokens (~200 words). To work within this limit, documents are LLM-summarized before storage — the summary is stored as ChromaDB's `document` (embedded for ANN search).
+- **Chunking (v0.0.32)**: Long documents are split into chunks of `kb_chunk_size` words before storage. Each chunk is independently summarized and stored as a separate ChromaDB entry. Metadata per chunk: `source`, `title`, `full_text` (chunk text), `chunk_id` ("0", "1", ...).
+- **Retrieval**: Returns individual chunks (not full documents) via `metadatas["full_text"]`. Falls back to `document` text for backward compatibility with pre-v0.0.32 entries.
+- **Chunk ID display**: Output includes `(chunk N)` labels for each retrieved chunk.
+- **Reference deduplication**: When multiple chunks from the same source URL are retrieved, the `Reference:` line appears only on the first chunk — preventing duplicate URLs in the synthesize context.
+- Filters by distance threshold (`kb_max_distance`, default 0.8)
 - Returns formatted results with source metadata, or `"No relevant local knowledge found."`
-- Output format for web-origin docs: `[n] text\n    Reference: [Title](URL)`
+- Output format: `[n] (chunk N) text\n    Reference: [Title](URL)` (Reference only on first chunk per source)
 
 ### 6. evaluate_sufficiency (LLM call)
 - Triggered after `fetch_local_knowledge` completes
@@ -114,6 +118,8 @@ parse → route_by_parse_result (driven by question_type from parser)
 - Uses `knowledge_query` or `news_query` from parse result for Brave web search query
 - Searches Brave web API (top 3 results)
 - **Stores results in ChromaDB** for future local retrieval (auto-population)
+- **Chunked storage (v0.0.32)**: Before storing, each result is split into chunks of `kb_chunk_size` words. Each chunk is independently summarized via `_summarize_for_embedding` (texts at or under `kb_summarize_limit` words skip the LLM call). Each chunk stored as a separate ChromaDB entry with metadata: `source`, `title`, `full_text` (chunk text), `chunk_id` ("0", "1", ...). On LLM failure, falls back to a truncated prefix.
+- **Output**: Web results are displayed as-is (no chunk labels) since chunking is for future local retrieval. Format uses shared `_format_knowledge_results()` helper with reference deduplication.
 - **URL/title retention**: Results include title and URL metadata, stored in ChromaDB. Output format: `[n] text\n    Reference: [Title](URL)` — enables the synthesize node to include clickable source references.
 - Gracefully returns `"No relevant web results found."` if no API key or no results
 
@@ -171,7 +177,9 @@ Configured via environment variables / `.env`:
 | `CHROMA_PERSIST_DIR` | `data/chroma` | ChromaDB storage directory |
 | `CHROMA_COLLECTION_NAME` | `financial_knowledge` | ChromaDB collection name |
 | `KB_MAX_RESULTS` | `3` | Max documents to fetch from ChromaDB per query |
-| `KB_MAX_DISTANCE` | `0.5` | Max cosine distance for "good" results |
+| `KB_MAX_DISTANCE` | `0.8` | Max cosine distance for "good" results |
+| `KB_CHUNK_SIZE` | `5000` | Max words per chunk for ChromaDB storage |
+| `KB_SUMMARIZE_LIMIT` | `200` | Word threshold for LLM summarization before embedding |
 
 ## Data Models
 

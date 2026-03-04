@@ -45,37 +45,9 @@ class AskRequest(BaseModel):
     question: str
 
 
-class AskResponseData(BaseModel):
-    question: str
-    answer: str
-
-
-class APIResponse(BaseModel):
-    status: str
-    data: AskResponseData | None = None
-    message: str
-
-
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
-
-
-@app.post("/api/ask", response_model=APIResponse)
-async def ask(request: AskRequest) -> APIResponse:
-    try:
-        answer = await agent.ask(request.question)
-        return APIResponse(
-            status="ok",
-            data=AskResponseData(question=request.question, answer=answer),
-            message="Question answered successfully",
-        )
-    except ValueError as e:
-        return APIResponse(status="error", data=None, message=str(e))
-    except Exception:
-        return APIResponse(
-            status="error", data=None, message="Internal server error"
-        )
 
 
 # ---------------------------------------------------------------------------

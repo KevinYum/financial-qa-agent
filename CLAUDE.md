@@ -84,7 +84,6 @@ financial-qa-agent/
 - Tests: `uv run pytest`
 
 ### 7. API Design
-- Batch endpoint: `POST /api/ask` — receives a financial question, returns an answer (JSON envelope).
 - Streaming endpoint: `POST /api/ask/stream` — SSE stream with progressive trace events + final answer.
-- All batch responses follow: `{"status": "ok"|"error", "data": ..., "message": "..."}`
+- Health check: `GET /health` — returns `{"status": "ok"}`
 - SSE events: `trace`, `tool_input`, `tool_output`, `answer`, `error`, `done`

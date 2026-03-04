@@ -308,19 +308,24 @@ async def test_news_search_uses_refined_query():
 
 @pytest.mark.asyncio
 async def test_local_knowledge_good_results():
-    """Local knowledge returns good ChromaDB results."""
+    """Local knowledge returns full_text from metadata with chunk ID label."""
     import chromadb
 
     client = chromadb.Client()
     collection = client.create_collection("test_local_good", metadata={"hnsw:space": "cosine"})
+    # Simulate post-v0.0.32 storage: document = summary, full_text + chunk_id in metadata
     collection.add(
-        ids=["doc1", "doc2"],
+        ids=["doc1_chunk_0"],
         documents=[
-            "Compound interest is interest calculated on both the initial "
-            "principal and the accumulated interest from previous periods.",
-            "Simple interest is calculated only on the original principal amount.",
+            "Compound interest: principal plus accumulated interest."
         ],
-        metadatas=[{"source": "local"}, {"source": "local"}],
+        metadatas=[{
+            "source": "local",
+            "full_text": "Compound interest is interest calculated on both the initial "
+            "principal and the accumulated interest from previous periods. "
+            "This results in exponential growth over time.",
+            "chunk_id": "0",
+        }],
     )
 
     with patch(
@@ -330,7 +335,10 @@ async def test_local_knowledge_good_results():
         from src.financial_qa_agent.tools.knowledge_base import fetch_local_knowledge
 
         result = await fetch_local_knowledge("What is compound interest?")
-        assert "interest" in result.lower()
+        # Should return full_text, not the summary document
+        assert "exponential growth" in result
+        # Should include chunk ID label
+        assert "(chunk 0)" in result
 
 
 @pytest.mark.asyncio
@@ -432,17 +440,25 @@ async def test_web_knowledge_success():
             "src.financial_qa_agent.tools.knowledge_base.httpx.AsyncClient",
             return_value=mock_http_client,
         ),
+        patch(
+            "src.financial_qa_agent.tools.knowledge_base._summarize_for_embedding",
+            new_callable=AsyncMock,
+            return_value="Summary: options trading guide",
+        ),
     ):
         mock_settings.brave_api_key = "test-key"
+        mock_settings.kb_chunk_size = 200
         from src.financial_qa_agent.tools.knowledge_base import fetch_web_knowledge
 
         result = await fetch_web_knowledge("What are options?")
         assert "Options Trading Guide" in result
         assert "Reference:" in result
 
-    # Verify results were stored in ChromaDB
-    stored = collection.get()
+    # Verify results were stored in ChromaDB with full_text and chunk_id in metadata
+    stored = collection.get(include=["metadatas"])
     assert len(stored["ids"]) > 0
+    assert stored["metadatas"][0]["full_text"] == "Options Trading Guide: Learn about options"
+    assert stored["metadatas"][0]["chunk_id"] == "0"
 
 
 @pytest.mark.asyncio
@@ -505,14 +521,379 @@ async def test_web_knowledge_includes_reference_urls():
             "src.financial_qa_agent.tools.knowledge_base.httpx.AsyncClient",
             return_value=mock_http_client,
         ),
+        patch(
+            "src.financial_qa_agent.tools.knowledge_base._summarize_for_embedding",
+            new_callable=AsyncMock,
+            return_value="Summary: ETF basics guide",
+        ),
     ):
         mock_settings.brave_api_key = "test-key"
+        mock_settings.kb_chunk_size = 200
         from src.financial_qa_agent.tools.knowledge_base import fetch_web_knowledge
 
         result = await fetch_web_knowledge("What is an ETF?")
         # Verify markdown reference format
         assert "Reference:" in result
         assert "[ETF Basics Guide](https://example.com/etf-guide)" in result
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Embedding Summarization — _summarize_for_embedding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_summarize_for_embedding_short_text_passthrough():
+    """Text ≤200 words is returned as-is without LLM call."""
+    from src.financial_qa_agent.tools.knowledge_base import _summarize_for_embedding
+
+    short_text = "This is a short text about compound interest."
+    result = await _summarize_for_embedding(short_text)
+    assert result == short_text
+
+
+@pytest.mark.asyncio
+async def test_summarize_for_embedding_long_text_calls_llm():
+    """Text >200 words triggers LLM summarization."""
+    from src.financial_qa_agent.tools.knowledge_base import _summarize_for_embedding
+
+    long_text = " ".join(["word"] * 250)  # 250 words
+
+    mock_llm_response = MagicMock()
+    mock_llm_response.content = "A concise summary of the long text."
+    mock_llm = AsyncMock()
+    mock_llm.ainvoke = AsyncMock(return_value=mock_llm_response)
+
+    with patch(
+        "src.financial_qa_agent.agent._build_llm",
+        return_value=mock_llm,
+    ):
+        result = await _summarize_for_embedding(long_text)
+        assert result == "A concise summary of the long text."
+        mock_llm.ainvoke.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_summarize_for_embedding_llm_failure_fallback():
+    """LLM failure falls back to truncated prefix."""
+    from src.financial_qa_agent.tools.knowledge_base import _summarize_for_embedding
+
+    long_text = " ".join(["word"] * 250)
+
+    with patch(
+        "src.financial_qa_agent.agent._build_llm",
+        side_effect=RuntimeError("LLM unavailable"),
+    ):
+        result = await _summarize_for_embedding(long_text)
+        assert len(result) <= 1000
+        assert result == long_text[:1000]
+
+
+@pytest.mark.asyncio
+async def test_store_chromadb_saves_full_text_in_metadata():
+    """_store_in_chromadb stores summary as document and full text in metadatas."""
+    import chromadb
+    from src.financial_qa_agent.tools.knowledge_base import _store_in_chromadb
+
+    client = chromadb.Client()
+    collection = client.create_collection(
+        "test_store_full_text", metadata={"hnsw:space": "cosine"}
+    )
+
+    results = [
+        {"text": "Full original article text about ETFs and investing.", "source": "https://x.com", "title": "ETF Guide"}
+    ]
+
+    with patch(
+        "src.financial_qa_agent.tools.knowledge_base._summarize_for_embedding",
+        new_callable=AsyncMock,
+        return_value="Summary: ETFs and investing.",
+    ):
+        await _store_in_chromadb(collection, results)
+
+    stored = collection.get(include=["documents", "metadatas"])
+    assert len(stored["ids"]) == 1
+    # Document is the summary (for embedding)
+    assert stored["documents"][0] == "Summary: ETFs and investing."
+    # Metadata has full original text and chunk info
+    assert stored["metadatas"][0]["full_text"] == "Full original article text about ETFs and investing."
+    assert stored["metadatas"][0]["source"] == "https://x.com"
+    assert stored["metadatas"][0]["title"] == "ETF Guide"
+    assert stored["metadatas"][0]["chunk_id"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_local_knowledge_backward_compat_no_full_text():
+    """Old ChromaDB entries without full_text metadata still work (fallback to document)."""
+    import chromadb
+
+    client = chromadb.Client()
+    collection = client.create_collection(
+        "test_local_backward", metadata={"hnsw:space": "cosine"}
+    )
+    # Pre-v0.0.31 entry: no full_text in metadata
+    collection.add(
+        ids=["old_doc"],
+        documents=["Old document about bond yields and maturity dates."],
+        metadatas=[{"source": "https://old.com", "title": "Bond Guide"}],
+    )
+
+    with patch(
+        "src.financial_qa_agent.tools.knowledge_base._get_collection",
+        return_value=collection,
+    ):
+        from src.financial_qa_agent.tools.knowledge_base import fetch_local_knowledge
+
+        result = await fetch_local_knowledge("What are bond yields?")
+        # Should return document text as fallback
+        assert "bond yields" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Chunking — _chunk_text
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_text_short_passthrough():
+    """Text at or under chunk_size words returns a single-element list."""
+    from src.financial_qa_agent.tools.knowledge_base import _chunk_text
+
+    text = "Short text about financial markets."
+    result = _chunk_text(text, chunk_size=200)
+    assert result == [text]
+    assert len(result) == 1
+
+
+def test_chunk_text_splits_long_text():
+    """Text of 500 words with chunk_size=200 produces 3 chunks."""
+    from src.financial_qa_agent.tools.knowledge_base import _chunk_text
+
+    words = [f"word{i}" for i in range(500)]
+    text = " ".join(words)
+    result = _chunk_text(text, chunk_size=200)
+    assert len(result) == 3
+    # First chunk has 200 words
+    assert len(result[0].split()) == 200
+    # Second chunk has 200 words
+    assert len(result[1].split()) == 200
+    # Third chunk has the remaining 100 words
+    assert len(result[2].split()) == 100
+
+
+def test_chunk_text_exact_boundary():
+    """Text of exactly 400 words with chunk_size=200 produces 2 exact chunks."""
+    from src.financial_qa_agent.tools.knowledge_base import _chunk_text
+
+    words = [f"w{i}" for i in range(400)]
+    text = " ".join(words)
+    result = _chunk_text(text, chunk_size=200)
+    assert len(result) == 2
+    assert len(result[0].split()) == 200
+    assert len(result[1].split()) == 200
+
+
+# ---------------------------------------------------------------------------
+# Chunking — _store_in_chromadb with chunks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_store_chromadb_chunks_long_text():
+    """Long result (>chunk_size words) produces multiple ChromaDB entries with chunk_id metadata."""
+    import chromadb
+    from src.financial_qa_agent.tools.knowledge_base import _store_in_chromadb
+
+    client = chromadb.Client()
+    collection = client.create_collection(
+        "test_store_chunks", metadata={"hnsw:space": "cosine"}
+    )
+
+    # 450 words → should produce 3 chunks (200 + 200 + 50) with kb_chunk_size=200
+    long_text = " ".join([f"word{i}" for i in range(450)])
+    results = [{"text": long_text, "source": "https://example.com/long", "title": "Long Article"}]
+
+    with patch(
+        "src.financial_qa_agent.tools.knowledge_base._summarize_for_embedding",
+        new_callable=AsyncMock,
+        side_effect=lambda t: f"Summary of {len(t.split())} words",
+    ), patch(
+        "src.financial_qa_agent.tools.knowledge_base.settings"
+    ) as mock_s:
+        mock_s.kb_chunk_size = 200
+        await _store_in_chromadb(collection, results)
+
+    stored = collection.get(include=["documents", "metadatas"])
+    assert len(stored["ids"]) == 3
+
+    # Check each chunk has correct metadata
+    for idx in range(3):
+        meta = stored["metadatas"][idx]
+        assert meta["chunk_id"] == str(idx)
+        assert meta["source"] == "https://example.com/long"
+        assert meta["title"] == "Long Article"
+        # full_text is the chunk text, not the full document
+        chunk_words = meta["full_text"].split()
+        if idx < 2:
+            assert len(chunk_words) == 200
+        else:
+            assert len(chunk_words) == 50
+
+
+@pytest.mark.asyncio
+async def test_store_chromadb_short_text_single_chunk():
+    """Short result (≤chunk_size words) produces a single entry with chunk_id='0'."""
+    import chromadb
+    from src.financial_qa_agent.tools.knowledge_base import _store_in_chromadb
+
+    client = chromadb.Client()
+    collection = client.create_collection(
+        "test_store_short", metadata={"hnsw:space": "cosine"}
+    )
+
+    results = [{"text": "A short article about ETFs.", "source": "https://x.com", "title": "ETF Intro"}]
+
+    with patch(
+        "src.financial_qa_agent.tools.knowledge_base._summarize_for_embedding",
+        new_callable=AsyncMock,
+        return_value="Summary: short ETF article.",
+    ):
+        await _store_in_chromadb(collection, results)
+
+    stored = collection.get(include=["metadatas"])
+    assert len(stored["ids"]) == 1
+    assert stored["metadatas"][0]["chunk_id"] == "0"
+    assert stored["metadatas"][0]["full_text"] == "A short article about ETFs."
+
+
+# ---------------------------------------------------------------------------
+# Chunk-aware retrieval and formatting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_local_knowledge_shows_chunk_ids():
+    """Retrieval output includes (chunk N) labels for chunked entries."""
+    import chromadb
+
+    client = chromadb.Client()
+    collection = client.create_collection("test_chunk_display", metadata={"hnsw:space": "cosine"})
+    collection.add(
+        ids=["doc1_chunk_0", "doc1_chunk_1"],
+        documents=["Summary of part 1", "Summary of part 2"],
+        metadatas=[
+            {"source": "https://x.com/article", "title": "Article", "full_text": "Full text of part 1.", "chunk_id": "0"},
+            {"source": "https://x.com/article", "title": "Article", "full_text": "Full text of part 2.", "chunk_id": "1"},
+        ],
+    )
+
+    with patch(
+        "src.financial_qa_agent.tools.knowledge_base._get_collection",
+        return_value=collection,
+    ), patch(
+        "src.financial_qa_agent.tools.knowledge_base.settings"
+    ) as mock_s:
+        mock_s.kb_max_results = 5
+        mock_s.kb_max_distance = 0.99
+        from src.financial_qa_agent.tools.knowledge_base import fetch_local_knowledge
+
+        result = await fetch_local_knowledge("article topic")
+        assert "(chunk 0)" in result
+        assert "(chunk 1)" in result
+
+
+@pytest.mark.asyncio
+async def test_local_knowledge_deduplicates_references():
+    """Multiple chunks from same source URL produce Reference line only once."""
+    import chromadb
+
+    client = chromadb.Client()
+    collection = client.create_collection("test_dedup_refs", metadata={"hnsw:space": "cosine"})
+    collection.add(
+        ids=["a_chunk_0", "a_chunk_1"],
+        documents=["Summary chunk 0", "Summary chunk 1"],
+        metadatas=[
+            {"source": "https://x.com/page", "title": "Page", "full_text": "Chunk zero text.", "chunk_id": "0"},
+            {"source": "https://x.com/page", "title": "Page", "full_text": "Chunk one text.", "chunk_id": "1"},
+        ],
+    )
+
+    with patch(
+        "src.financial_qa_agent.tools.knowledge_base._get_collection",
+        return_value=collection,
+    ), patch(
+        "src.financial_qa_agent.tools.knowledge_base.settings"
+    ) as mock_s:
+        mock_s.kb_max_results = 5
+        mock_s.kb_max_distance = 0.99
+        from src.financial_qa_agent.tools.knowledge_base import fetch_local_knowledge
+
+        result = await fetch_local_knowledge("page topic")
+        # Reference line should appear only ONCE
+        assert result.count("Reference:") == 1
+        assert "[Page](https://x.com/page)" in result
+
+
+@pytest.mark.asyncio
+async def test_local_knowledge_backward_compat_no_chunk_id():
+    """Old entries without chunk_id metadata render without (chunk N) label."""
+    import chromadb
+
+    client = chromadb.Client()
+    collection = client.create_collection("test_no_chunk_id", metadata={"hnsw:space": "cosine"})
+    # Pre-v0.0.32 entry: has full_text but no chunk_id
+    collection.add(
+        ids=["old_entry"],
+        documents=["Summary of old entry about financial markets"],
+        metadatas=[{
+            "source": "https://old.com",
+            "title": "Old Doc",
+            "full_text": "Full text of old document about markets.",
+        }],
+    )
+
+    with patch(
+        "src.financial_qa_agent.tools.knowledge_base._get_collection",
+        return_value=collection,
+    ), patch(
+        "src.financial_qa_agent.tools.knowledge_base.settings"
+    ) as mock_s:
+        mock_s.kb_max_results = 3
+        mock_s.kb_max_distance = 0.99  # Wide threshold to ensure match
+        from src.financial_qa_agent.tools.knowledge_base import fetch_local_knowledge
+
+        result = await fetch_local_knowledge("financial markets")
+        # Should NOT have chunk label
+        assert "(chunk" not in result
+        # But should still have the text
+        assert "old document about markets" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_summarize_uses_config_limit():
+    """_summarize_for_embedding uses kb_summarize_limit setting, not hardcoded 200."""
+    from src.financial_qa_agent.tools.knowledge_base import _summarize_for_embedding
+
+    # Text with 150 words — should be passthrough with default limit=200
+    text_150 = " ".join(["word"] * 150)
+    result = await _summarize_for_embedding(text_150)
+    assert result == text_150  # No LLM call needed
+
+    # Now set a low limit so 150 words triggers LLM
+    mock_llm_response = MagicMock()
+    mock_llm_response.content = "Short summary."
+    mock_llm = AsyncMock()
+    mock_llm.ainvoke = AsyncMock(return_value=mock_llm_response)
+
+    with patch(
+        "src.financial_qa_agent.tools.knowledge_base.settings"
+    ) as mock_s, patch(
+        "src.financial_qa_agent.agent._build_llm",
+        return_value=mock_llm,
+    ):
+        mock_s.kb_summarize_limit = 100  # Lower than 150 words → triggers LLM
+        result = await _summarize_for_embedding(text_150)
+        assert result == "Short summary."
+        mock_llm.ainvoke.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

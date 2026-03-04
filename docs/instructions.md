@@ -890,3 +890,144 @@ The old `knowledge_queries: list[str]` approach had the parse LLM generate multi
 - All 108 tests passing
 
 ---
+
+## v0.0.30 — 2026-03-04 — Remove Unused Batch Endpoint + Fix Agent Loop Diagram
+
+**Instruction**:
+> 1. why there is still non stream post api/ask, if is not used, just delete this api in code and in architecture graph
+> 2. the agent loop in architecture section have minor error: analysis prompt should be point to right side synthesize
+
+**Design Decisions**:
+1. **Remove batch endpoint entirely** — The `POST /api/ask` endpoint was unused by the frontend (which only uses `POST /api/ask/stream` via SSE). Removed the route handler, its Pydantic response models (`AskResponseData`, `APIResponse`), and all 3 batch tests. The `FinancialQAAgent.ask()` method is kept as a clean programmatic API (useful for testing and scripting).
+2. **Fix agent loop diagram** — The analysis prompt label `← Analysis prompt (## Fact + ## Analysis + ## References)` was positioned under the left-side `synthesize (knowledge)` box. Moved it to point `→` at the right-side `synthesize (analysis)` box where it belongs.
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/main.py`:
+  - Removed `AskResponseData` and `APIResponse` Pydantic models
+  - Removed `POST /api/ask` route handler
+  - Kept `AskRequest` model (shared with stream endpoint)
+- Updated `tests/test_api.py`:
+  - Removed `test_ask_success`, `test_ask_empty_question`, `test_ask_missing_question` (3 batch tests)
+  - Removed `mock.ask` from mock fixture (only `ask_with_trace` needed)
+  - Removed unused `asyncio` import
+  - 4 tests remain (health + 3 SSE stream tests)
+- Updated `README.md`:
+  - System Architecture Mermaid: removed `ASK["POST /api/ask"]` route, removed `RES["APIResponse"]` model
+  - Agent Loop diagram: moved analysis prompt label to right-side synthesize box
+  - Interaction pattern: removed "A batch endpoint ... is also available" sentence
+  - API Reference table: removed batch endpoint row
+  - Request/Response examples: removed batch response example
+  - Project structure: updated test count (7 → 4)
+- Updated `specs/api.md` (v0.4.0): removed `POST /api/ask` section, updated response format section
+- Updated `CLAUDE.md`: removed batch endpoint from API Design section
+- All 105 tests passing
+
+---
+
+## v0.0.31 — 2026-03-04 — Knowledge Hub: LLM-Summarized Embeddings with Full-Text Retrieval
+
+**Instruction**:
+> now that the current embedding is a 200 word embedding, I will need you refactor the way when saving into the knowledge hub, using llm call to first summarize text within 200 words, which will be used in index (let's say when query ANN), but you should still save the entire text so that when retrieval you can get the entire text to put into context
+
+**Root Cause**:
+ChromaDB's default embedding model (all-MiniLM-L6-v2) silently truncates input to 256 tokens (~200 words). The knowledge hub was storing full text directly as ChromaDB's `document` field, meaning any text beyond ~200 words was invisible to semantic search — the embedding only represented the first ~200 words.
+
+**Design Decisions**:
+1. **LLM-summarized embeddings** — Before storing in ChromaDB, each document is summarized via an LLM call to produce a concise ~200-word summary optimized for the embedding window. This summary becomes the ChromaDB `document` (embedded for ANN search).
+2. **Full text in metadata** — The original full text is preserved in `metadatas["full_text"]`. On retrieval, `full_text` is returned to the LLM context (not the summary).
+3. **Short text bypass** — Texts ≤200 words skip the LLM call (already fit in the embedding window).
+4. **Graceful fallback** — If the LLM summarization fails, falls back to a truncated prefix (`text[:1000]`).
+5. **Backward compatibility** — Old documents without `full_text` in metadata fall back to the `document` text on retrieval.
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/tools/knowledge_base.py`:
+  - Added `SUMMARIZE_FOR_EMBEDDING_PROMPT` and `_summarize_for_embedding(text)` — LLM-based summarization for embedding, with short-text bypass and failure fallback
+  - Made `_store_in_chromadb()` async — now calls `_summarize_for_embedding()` for each document, stores summary as `document`, original text as `metadatas["full_text"]`
+  - Updated `fetch_local_knowledge()` — retrieves `meta.get("full_text") or doc` for backward compatibility
+  - Updated `fetch_web_knowledge()` — `await _store_in_chromadb(...)` (now async)
+  - Updated module docstring to document the 256-token limit and summarization strategy
+- Updated tests in `tests/test_tools.py`:
+  - Modified `test_web_knowledge_success` — mocks summarizer, verifies `full_text` in stored metadata
+  - Modified `test_web_knowledge_includes_reference_urls` — mocks summarizer
+  - Modified `test_local_knowledge_good_results` — tests full_text retrieval path
+  - Added `test_summarize_for_embedding_short_text_passthrough` — ≤200 words → no LLM call
+  - Added `test_summarize_for_embedding_long_text_calls_llm` — >200 words → LLM summary
+  - Added `test_summarize_for_embedding_llm_failure_fallback` — LLM error → truncated prefix
+  - Added `test_store_chromadb_saves_full_text_in_metadata` — verifies storage format
+  - Added `test_local_knowledge_backward_compat_no_full_text` — old entries without full_text work
+- Updated `specs/agent.md` — knowledge base nodes (embedding strategy, storage format, retrieval logic)
+- Updated `README.md` — test count (26 → 31)
+- All 110 tests passing
+
+---
+
+## v0.0.32 — 2026-03-04
+
+**Instruction**: Add chunking logic for long documents in the knowledge hub vector database:
+1. When saving, chunk original text by max word-length limit
+2. When retrieving, return only matched chunks — not the full document
+3. In trace tab, print chunk IDs and separate entries per chunk
+4. In result output, merge duplicate references from different chunks of the same URL
+5. Make chunk size and summarize limit configurable in settings
+
+**Design Decisions**:
+1. **Word-based chunking** — Split by `kb_chunk_size` words (default 200, aligned with embedding model's ~256-token limit). Each chunk gets an independent ChromaDB entry with its own embedding.
+2. **Chunk ID format** — `{sha256(source:text[:200])[:16]}_chunk_{n}` where n is 0-indexed. Deterministic and collision-resistant.
+3. **Chunk-level full_text** — `metadatas["full_text"]` stores the chunk's text, not the original full document. Retrieval returns only matched chunks (not the whole document).
+4. **Reference deduplication** — Shared `_format_knowledge_results()` helper prints the `Reference:` line only on the first chunk from each source URL. Multiple chunks from the same source get separate text entries but deduplicated references.
+5. **Configurable settings** — `kb_chunk_size` (max words per chunk, default 200) and `kb_summarize_limit` (word threshold for LLM summarization, default 200) added to `Settings` class.
+6. **Web results shown as-is** — `fetch_web_knowledge` output shows raw Brave results (no chunk labels). Chunking happens during `_store_in_chromadb()` for future local retrieval. Chunk IDs appear only in `fetch_local_knowledge` output.
+7. **Backward compatibility** — Old entries without `chunk_id` metadata render without `(chunk N)` label.
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/config.py`:
+  - Added `kb_chunk_size: int = 200` and `kb_summarize_limit: int = 200` to Settings
+- Updated `.env.example`:
+  - Added commented-out `KB_CHUNK_SIZE` and `KB_SUMMARIZE_LIMIT`
+- Updated `src/financial_qa_agent/tools/knowledge_base.py`:
+  - Added `_chunk_text(text, chunk_size)` — word-based splitting
+  - Added `_chunk_id(text, source, chunk_index)` — deterministic chunk ID generation
+  - Updated `_summarize_for_embedding()` — uses configurable `settings.kb_summarize_limit` instead of hardcoded 200
+  - Updated `_store_in_chromadb()` — chunks each result before storage, stores chunk text in `full_text`, adds `chunk_id` metadata
+  - Added `_format_knowledge_results()` — shared formatting helper with chunk ID labels and reference deduplication
+  - Updated `fetch_local_knowledge()` — reads `chunk_id` from metadata, uses new formatter
+  - Updated `fetch_web_knowledge()` — uses new formatter for consistent output
+  - Updated module docstring to document chunking strategy
+- Updated tests in `tests/test_tools.py`:
+  - Modified `test_local_knowledge_good_results` — includes `chunk_id` in metadata, asserts `(chunk 0)` in output
+  - Modified `test_web_knowledge_success` — asserts `chunk_id="0"` in stored metadata
+  - Modified `test_store_chromadb_saves_full_text_in_metadata` — asserts `chunk_id="0"`
+  - Modified `test_web_knowledge_includes_reference_urls` — sets `kb_chunk_size` on mock settings
+  - Added `test_chunk_text_short_passthrough` — ≤chunk_size words → single chunk
+  - Added `test_chunk_text_splits_long_text` — 500 words → 3 chunks (200+200+100)
+  - Added `test_chunk_text_exact_boundary` — 400 words → 2 exact chunks
+  - Added `test_store_chromadb_chunks_long_text` — long result → multiple ChromaDB entries with correct chunk_id metadata
+  - Added `test_store_chromadb_short_text_single_chunk` — short result → single entry with chunk_id="0"
+  - Added `test_local_knowledge_shows_chunk_ids` — output includes `(chunk N)` labels
+  - Added `test_local_knowledge_deduplicates_references` — same-source chunks → Reference only once
+  - Added `test_local_knowledge_backward_compat_no_chunk_id` — old entries without chunk_id render without label
+  - Added `test_summarize_uses_config_limit` — uses `kb_summarize_limit` setting, not hardcoded 200
+- Updated `specs/agent.md` v0.9.0 — knowledge base nodes: chunking, chunk-level retrieval, metadata schema, dedup, config
+- Updated `README.md` — test counts (31 → 40 tools, 39 → 37 models)
+- All 119 tests passing
+
+---
+
+## v0.0.33 — 2026-03-04
+
+**Instruction**: Fix local knowledge retrieval returning only 1 result (and not the best match).
+
+**Root Cause**: The `kb_max_distance` threshold was 0.5, which is too strict for the all-MiniLM-L6-v2 embedding model with cosine distance — especially for Chinese text. Investigation with actual data showed that for query "市净率定义" (P/B ratio definition), the correct match "市净率 - MBA智库百科" had distance 0.628 (above 0.5), while only an incorrect match "市盈率 - 維基大典" (P/E ratio) at distance 0.488 passed the threshold. The model produces cosine distances in the 0.3–0.7 range for relevant content.
+
+An initial attempt using a larger candidate pool (`max(kb_max_results * 5, 20)`) was incorrect — ChromaDB returns results sorted by distance ascending (best first), so additional candidates always have worse distances and cannot pass a threshold that the top-N candidates already failed.
+
+**Fix**: Raised `kb_max_distance` default from 0.5 to 0.8. Reverted the unnecessary candidate pool change — `fetch_local_knowledge` now queries ChromaDB directly with `n_results=kb_max_results` (simple and correct). Also fixed `test_store_chromadb_chunks_long_text` to mock `kb_chunk_size=200` since the user changed the default to 5000.
+
+**Actions Taken**:
+- Updated `src/financial_qa_agent/config.py` — `kb_max_distance` default: 0.5 → 0.8
+- Updated `src/financial_qa_agent/tools/knowledge_base.py` — reverted candidate pool, simplified `fetch_local_knowledge()` to query with `n_results=kb_max_results` directly
+- Updated `tests/test_tools.py` — `test_store_chromadb_chunks_long_text`: mock `kb_chunk_size=200`
+- Updated `specs/agent.md` — `kb_max_distance` default to 0.8
+- All 119 tests passing
+
+---

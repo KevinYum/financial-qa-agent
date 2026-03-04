@@ -46,13 +46,11 @@ flowchart TB
 
         subgraph Routes["API Routes"]
             HEALTH["GET /health"]
-            ASK["POST /api/ask"]
             STREAM["POST /api/ask/stream\n(SSE)"]
         end
 
         subgraph Models["Pydantic Models"]
             REQ["AskRequest\n{question}"]
-            RES["APIResponse\n{status, data, message}"]
         end
 
         subgraph AgentCore["LangGraph Agent (agent.py)"]
@@ -120,7 +118,7 @@ flowchart TB
     style Local fill:#e2e3e5,stroke:#495057
 ```
 
-**Interaction Pattern**: The frontend sends `POST /api/ask/stream` via `fetch()`. FastAPI validates through Pydantic, then launches the LangGraph agent with a trace queue. The agent parses the question into structured entities (tickers, time period, news flag, knowledge queries, fundamental data needs), then routes based on the parser's `question_type`: **analysis** (parser says analysis + tickers present → market data + optional fundamental data + optional news → sectioned answer: Fact + Analysis + References) or **knowledge hub** (parser says knowledge → local ChromaDB first → LLM evaluates sufficiency → if insufficient, web search → sectioned answer: Answer + References; tickers are ignored). For equity tickers, the parser can request FMP fundamental data (financial statements, earnings transcripts); transcripts are summarized via LLM before inclusion. The LLM produces markdown with `##` section headers; the frontend renders it via `marked.js` (sanitized with DOMPurify) so headers, links, lists, bold text, tables, and code all display correctly. Each pipeline stage emits trace events to an `asyncio.Queue`, which the SSE generator streams to the browser in real-time. The frontend renders trace events in a 4-tab trace panel (Agent Loop, Market Data with Price/Fundamental sub-sections, News, Knowledge with Local/Online sub-sections) and the final markdown answer in the chat panel. A batch endpoint (`POST /api/ask`) is also available for backward compatibility.
+**Interaction Pattern**: The frontend sends `POST /api/ask/stream` via `fetch()`. FastAPI validates through Pydantic, then launches the LangGraph agent with a trace queue. The agent parses the question into structured entities (tickers, time period, news flag, knowledge queries, fundamental data needs), then routes based on the parser's `question_type`: **analysis** (parser says analysis + tickers present → market data + optional fundamental data + optional news → sectioned answer: Fact + Analysis + References) or **knowledge hub** (parser says knowledge → local ChromaDB first → LLM evaluates sufficiency → if insufficient, web search → sectioned answer: Answer + References; tickers are ignored). For equity tickers, the parser can request FMP fundamental data (financial statements, earnings transcripts); transcripts are summarized via LLM before inclusion. The LLM produces markdown with `##` section headers; the frontend renders it via `marked.js` (sanitized with DOMPurify) so headers, links, lists, bold text, tables, and code all display correctly. Each pipeline stage emits trace events to an `asyncio.Queue`, which the SSE generator streams to the browser in real-time. The frontend renders trace events in a 4-tab trace panel (Agent Loop, Market Data with Price/Fundamental sub-sections, News, Knowledge with Local/Online sub-sections) and the final markdown answer in the chat panel.
 
 ---
 
@@ -159,7 +157,7 @@ User Question
 │ synthesize   │  ← Knowledge prompt (## Answer + ## References)             │ synthesize   │
 │ (knowledge)  │                                                             │ (analysis)   │
 └──────┬──────┘                                                              └──────┬──────┘
-       │       ← Analysis prompt (## Fact + ## Analysis + ## References)            │
+       │                Analysis prompt (## Fact + ## Analysis + ## References) →    │
        ▼                                                                            ▼
 ┌─────────────┐
 │  response    │  ← Frontend parses ## sections, renders clickable links
@@ -202,10 +200,10 @@ financial-qa-agent/
 ├── tests/                          --- Test suite (all externals mocked)
 │   ├── __init__.py
 │   ├── conftest.py                 --- Shared fixtures (mock LLM responses)
-│   ├── test_api.py                 --- API endpoint + SSE stream tests (7 tests)
+│   ├── test_api.py                 --- API endpoint + SSE stream tests (4 tests)
 │   ├── test_agent.py               --- LangGraph pipeline + routing + trace tests (38 tests)
-│   ├── test_models.py              --- Pydantic model unit tests (39 tests)
-│   └── test_tools.py               --- Tool unit tests (26 tests)
+│   ├── test_models.py              --- Pydantic model unit tests (37 tests)
+│   └── test_tools.py               --- Tool unit tests (40 tests)
 │
 ├── specs/                          --- Living specifications
 │   ├── api.md                      --- Endpoint contracts and response format
@@ -225,28 +223,15 @@ financial-qa-agent/
 
 | Method | Endpoint            | Description                          |
 |--------|---------------------|--------------------------------------|
-| POST   | `/api/ask`          | Submit a financial question (batch)  |
-| POST   | `/api/ask/stream`   | Submit with SSE trace streaming      |
+| POST   | `/api/ask/stream`   | Submit question with SSE trace streaming |
 | GET    | `/health`           | Health check                         |
 
-**Request** (`POST /api/ask` or `POST /api/ask/stream`):
+**Request** (`POST /api/ask/stream`):
 ```json
 { "question": "What is compound interest?" }
 ```
 
-**Batch Response** (`/api/ask`):
-```json
-{
-  "status": "ok",
-  "data": {
-    "question": "What is compound interest?",
-    "answer": "..."
-  },
-  "message": "Question answered successfully"
-}
-```
-
-**SSE Stream** (`/api/ask/stream`): Returns `text/event-stream` with events: `trace`, `tool_input`, `tool_output`, `answer`, `error`, `done`. See [`specs/api.md`](specs/api.md) for full SSE event reference.
+**SSE Stream**: Returns `text/event-stream` with events: `trace`, `tool_input`, `tool_output`, `answer`, `error`, `done`. See [`specs/api.md`](specs/api.md) for full SSE event reference.
 
 ---
 

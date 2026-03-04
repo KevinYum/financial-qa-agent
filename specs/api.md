@@ -1,6 +1,6 @@
 # API Specification
 
-**Version**: 0.3.0
+**Version**: 0.4.0
 **Last Updated**: 2026-03-04
 
 ## Base URL
@@ -8,9 +8,8 @@
 
 ## Endpoints
 
-### POST /api/ask
-Receive a financial question and return an answer from the LangGraph-powered QA agent (batch response).
-The agent parses the question, fetches data from relevant tools (market data, news, knowledge base), and synthesizes a final answer via an LLM call.
+### POST /api/ask/stream
+Stream agent pipeline trace events as **Server-Sent Events (SSE)**. The frontend uses this endpoint for progressive trace updates.
 
 **Request Body**:
 ```json
@@ -18,32 +17,6 @@ The agent parses the question, fetches data from relevant tools (market data, ne
   "question": "string (required) — the user's financial question"
 }
 ```
-
-**Success Response** (200):
-```json
-{
-  "status": "ok",
-  "data": {
-    "question": "What is compound interest?",
-    "answer": "Compound interest is..."
-  },
-  "message": "Question answered successfully"
-}
-```
-
-**Error Response** (400/500):
-```json
-{
-  "status": "error",
-  "data": null,
-  "message": "Description of the error"
-}
-```
-
-### POST /api/ask/stream
-Stream agent pipeline trace events as **Server-Sent Events (SSE)**. The frontend uses this endpoint for progressive trace updates.
-
-**Request Body**: Same as `/api/ask`.
 
 **Response**: `text/event-stream` — a stream of SSE-formatted events.
 
@@ -97,13 +70,4 @@ Health check endpoint.
 ```
 
 ## Response Format
-`POST /api/ask` responses follow a consistent envelope:
-```json
-{
-  "status": "ok" | "error",
-  "data": <payload or null>,
-  "message": "human-readable message"
-}
-```
-
-`POST /api/ask/stream` returns an SSE stream (see above).
+`POST /api/ask/stream` returns an SSE stream (see above). The health endpoint returns a simple JSON object.

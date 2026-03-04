@@ -26,8 +26,10 @@ class Settings(BaseSettings):
     chroma_collection_name: str = "financial_knowledge"
 
     # Knowledge base tuning
-    kb_max_results: int = 3
-    kb_max_distance: float = 0.5
+    kb_max_results: int = 10
+    kb_max_distance: float = 0.8
+    kb_chunk_size: int = 2000  # Max words per chunk for ChromaDB storage
+    kb_summarize_limit: int = 200  # Word threshold for LLM summarization before embedding
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
